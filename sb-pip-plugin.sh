@@ -300,6 +300,9 @@ END { if (!(m && c && t)) exit 3 }
 # 菜单2的删除列表去重(ProxyIP 每个规则名对应两条路由规则)；匹配不到则不改动
 sed -i 's/map(select(\. != "telegram-ip")) | \.\[\]/map(select(. != "telegram-ip")) | unique | .[]/' "$out" 2>/dev/null
 
+# 「已启用的分流规则集」列表：ProxyIP 规则显示 规则名 -> ProxyIP:地址，而不是 direct；匹配不到则不改动
+sed -i 's/\\(\$r\.outbound)"/\\(if $r.override_address != null then "ProxyIP:" + $r.override_address else $r.outbound end)"/' "$out" 2>/dev/null
+
 bash -n "$out" 2>/dev/null || passthrough
 cat "$out"
 PIP_INJECT_EOF
