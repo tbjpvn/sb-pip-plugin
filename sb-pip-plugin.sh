@@ -25,13 +25,13 @@ yellow() { echo -e "\e[1;33m$1\033[0m"; }
 write_payload() {
 cat > "${plugin_dir}/proxyip.sh" <<'PIP_PAYLOAD_EOF'
 # ---- 公共 ProxyIP 分流 ----
-# 取 Cloudflare trace 里的 ip= / colo= ；$1=host(可空则直连) $2=ProxyIP $3=IP族参数(-4/-6)
+# 取 Cloudflare trace 里的 ip= / colo= ；$1=host(可空) $2=ProxyIP(空则直连) $3=IP族参数(-4/-6) $4=ProxyIP端口(默认443)
 _pip_trace() {
-    local host=${1:-www.cloudflare.com} pip=$2 fam=$3
-    local args=(-s -m 8 $fam)
+    local host=${1:-www.cloudflare.com} pip=$2 fam=$3 port=${4:-443}
+    local args=(-s --connect-timeout 5 -m 8 $fam)
     if [ -n "$pip" ]; then
         [[ "$pip" == *:* ]] && pip="[${pip}]"
-        args+=(--connect-to "${host}:443:${pip}:443")
+        args+=(--connect-to "${host}:443:${pip}:${port}")
     fi
     curl "${args[@]}" "https://${host}/cdn-cgi/trace" 2>/dev/null | grep -E '^(ip|colo)=' | tr '\n' ' '
 }
@@ -44,7 +44,7 @@ _pip_list_rules() {
       | select(.override_address != null and (.rule_set | type) == "array")
       | .rule_set[0] as $t
       | (first($root.route.rule_set[]? | select(.tag == $t) | .rules[0].domain_suffix | join(" ")) // "") as $d
-      | "\($t)\t\(.override_address)\t\($d)"
+      | "\($t)\t\(.override_address):\(.override_port // 443)\t\($d)"
     ' "$route_file" 2>/dev/null
 }
 
@@ -66,11 +66,13 @@ proxyip_menu() {
     echo ""
     green "1. 添加 ProxyIP 分流"
     red   "2. 删除 ProxyIP 分流"
+    yellow "3. 更换 ProxyIP (保留规则，批量改地址/端口，如原IP挂了)"
     purple "0. 返回上级菜单"
     reading "请输入选择: " pip_menu_choice
     case "$pip_menu_choice" in
         1) add_proxyip_route ;;
         2) delete_proxyip_route ;;
+        3) change_proxyip_route ;;
         0) warp_manage ;;
         *) red "无效选项"; sleep 1; proxyip_menu ;;
     esac
@@ -127,11 +129,101 @@ delete_proxyip_route() {
     sleep 2; proxyip_menu
 }
 
+# 解析 "地址[:端口]" -> 设置 pip_addr / pip_port(端口可为空)；格式无效返回1
+_pip_parse_addr() {
+    local in=$1
+    local r_v6p='^\[([^]]+)\]:([0-9]+)$' r_v6='^\[([^]]+)\]$' r_hp='^([^:]+):([0-9]+)$'
+    local r_dom='^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$' r_v4='^([0-9]{1,3}\.){3}[0-9]{1,3}$' r_v6b='^[0-9a-fA-F:]*:[0-9a-fA-F:]*:[0-9a-fA-F:]*$'
+    pip_addr=""; pip_port=""
+    if [[ "$in" =~ $r_v6p ]]; then pip_addr=${BASH_REMATCH[1]}; pip_port=${BASH_REMATCH[2]}
+    elif [[ "$in" =~ $r_v6 ]]; then pip_addr=${BASH_REMATCH[1]}
+    elif [[ "$in" =~ $r_hp ]]; then pip_addr=${BASH_REMATCH[1]}; pip_port=${BASH_REMATCH[2]}
+    else pip_addr=$in
+    fi
+    [[ "$pip_addr" =~ $r_dom || "$pip_addr" =~ $r_v4 || "$pip_addr" =~ $r_v6b ]] || return 1
+    if [ -n "$pip_port" ]; then
+        [ "$pip_port" -ge 1 ] && [ "$pip_port" -le 65535 ] || return 1
+    fi
+    return 0
+}
+
+# 探测 ProxyIP：指定了端口只测该端口；未指定则依次测 CF 的 HTTPS 端口，取第一个可用的
+# 读取 pip_addr/pip_port，设置 fam direct_info pip_info pip_port；返回 0=可用 1=不可用 2=服务器自身无网络
+_pip_probe() {
+    local ports p info ok_ports=() specified=0
+    [ -n "$pip_port" ] && specified=1
+    fam="-4"
+    direct_info=$(_pip_trace "" "" "$fam")
+    [ -z "$direct_info" ] && { fam="-6"; direct_info=$(_pip_trace "" "" "$fam"); }
+    if [ -z "$direct_info" ]; then
+        red "无法访问 cloudflare.com，请检查服务器网络"; return 2
+    fi
+    if [ $specified -eq 1 ]; then ports=("$pip_port"); else ports=(443 2053 2083 2087 2096 8443); fi
+    echo ""
+    green "服务器直连:   ${direct_info}"
+    pip_info=""
+    for p in "${ports[@]}"; do
+        info=$(_pip_trace "" "$pip_addr" "$fam" "$p")
+        if [ -n "$info" ]; then
+            green "  ✔ 端口 ${p}  ${info}"
+            ok_ports+=("$p")
+            if [ -z "$pip_info" ]; then pip_info=$info; pip_port=$p; fi
+        else
+            yellow "  ✘ 端口 ${p}  不可用"
+        fi
+    done
+    [ ${#ok_ports[@]} -eq 0 ] && return 1
+    if [ $specified -eq 0 ] && [ ${#ok_ports[@]} -gt 1 ]; then
+        yellow "多个端口可用 (${ok_ports[*]})，已选用 ${pip_port}；想指定端口请写成 ${pip_addr}:端口"
+    fi
+    return 0
+}
+
+change_proxyip_route() {
+    clear
+    green "=== 更换 ProxyIP ===\n"
+    if [ -z "$(_pip_list_rules)" ]; then
+        yellow "当前没有 ProxyIP 分流规则"; sleep 2; proxyip_menu; return
+    fi
+    yellow "把所有 ProxyIP 分流规则改指向新的 ProxyIP(域名列表不变)。"
+    local pip_addr pip_port fam direct_info pip_info pip_in
+    reading "请输入新的 ProxyIP，可带端口，如 tw.william.us.ci:8443 (不写端口则自动探测，回车返回): " pip_in
+    [ -z "$pip_in" ] && { proxyip_menu; return; }
+    pip_in=$(echo "$pip_in" | xargs)
+    if ! _pip_parse_addr "$pip_in"; then
+        red "地址或端口格式无效"; sleep 2; proxyip_menu; return
+    fi
+    _pip_probe
+    case $? in
+        0) ;;
+        2) sleep 2; proxyip_menu; return ;;
+        *) red "该 ProxyIP 不可用，已取消"; sleep 3; proxyip_menu; return ;;
+    esac
+
+    cp -f "$route_file" "${route_file}.bak"
+    jq_write "$route_file" --arg addr "$pip_addr" --argjson pport "$pip_port" '
+      .route.rules |= map(if .override_address != null then .override_address = $addr | .override_port = $pport else . end)
+    '
+    local check_output
+    check_output=$(validate_singbox_config)
+    if [ $? -ne 0 ]; then
+        cp -f "${route_file}.bak" "$route_file"
+        red "\n配置校验未通过，已自动回滚：\n"
+        echo "$check_output"
+        sleep 3; proxyip_menu; return
+    fi
+    rm -f "${route_file}.bak"
+
+    reload_singbox
+    green "\n已将所有 ProxyIP 分流改为 ${pip_addr}:${pip_port}"
+    sleep 2; proxyip_menu
+}
+
 add_proxyip_route() {
     clear
     green "=== 添加公共 ProxyIP 分流 ===\n"
     yellow "说明：ProxyIP 只是一个能中转TCP的CF相关地址，不是代理协议："
-    yellow " - 仅对 Cloudflare 托管的网站有效 (443端口/TLS)，其余站点会直接打不开"
+    yellow " - 仅对 Cloudflare 托管的网站有效 (TLS/HTTPS)，其余站点会直接打不开"
     yellow " - 对方服务器能看到你访问的域名，稳定性取决于对方\n"
 
     local sb_ver
@@ -141,28 +233,21 @@ add_proxyip_route() {
         sleep 3; warp_manage; return
     fi
 
-    reading "请输入 ProxyIP 域名或IP (回车返回): " pip_addr
-    [ -z "$pip_addr" ] && { warp_manage; return; }
-    pip_addr=$(echo "$pip_addr" | xargs)
+    local pip_addr pip_port fam direct_info pip_info pip_in
     local pip_re_dom='^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
-    local pip_re_v4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
-    if ! [[ "$pip_addr" =~ $pip_re_dom || "$pip_addr" =~ $pip_re_v4 || "$pip_addr" == *:* ]]; then
-        red "地址格式无效"; sleep 2; warp_manage; return
+    reading "请输入 ProxyIP，可带端口，如 tw.william.us.ci 或 tw.william.us.ci:8443 (不写端口则自动探测，回车返回): " pip_in
+    [ -z "$pip_in" ] && { warp_manage; return; }
+    pip_in=$(echo "$pip_in" | xargs)
+    if ! _pip_parse_addr "$pip_in"; then
+        red "地址或端口格式无效"; sleep 2; warp_manage; return
     fi
-
-    local fam="-4" direct_info pip_info
-    direct_info=$(_pip_trace "" "" "$fam")
-    [ -z "$direct_info" ] && { fam="-6"; direct_info=$(_pip_trace "" "" "$fam"); }
-    if [ -z "$direct_info" ]; then
-        red "无法访问 cloudflare.com，请检查服务器网络"; sleep 2; warp_manage; return
-    fi
-    pip_info=$(_pip_trace "" "$pip_addr" "$fam")
-    echo ""
-    green "服务器直连:   ${direct_info}"
-    if [ -z "$pip_info" ]; then
-        red "经 ${pip_addr} 访问失败：该 ProxyIP 不可用，已取消"; sleep 3; warp_manage; return
-    fi
-    green "经 ProxyIP:   ${pip_info}"
+    _pip_probe
+    case $? in
+        0) ;;
+        2) sleep 2; warp_manage; return ;;
+        *) red "该 ProxyIP 不可用 (所有测试端口均失败)，已取消"; sleep 3; warp_manage; return ;;
+    esac
+    green "经 ProxyIP:   ${pip_addr}:${pip_port}  ${pip_info}"
     local d_ip p_ip
     d_ip=$(echo "$direct_info" | sed -n 's/.*ip=\([^ ]*\).*/\1/p')
     p_ip=$(echo "$pip_info" | sed -n 's/.*ip=\([^ ]*\).*/\1/p')
@@ -212,7 +297,7 @@ add_proxyip_route() {
     yellow "正在检测各域名能否经 ProxyIP 访问..."
     local ok_domains=() d r
     for d in "${pip_domains[@]}"; do
-        r=$(_pip_trace "$d" "$pip_addr" "$fam")
+        r=$(_pip_trace "$d" "$pip_addr" "$fam" "$pip_port")
         if [ -n "$r" ]; then
             green "  ✔ ${d}  ${r}"; ok_domains+=("$d")
         else
@@ -221,18 +306,19 @@ add_proxyip_route() {
     done
     [ ${#ok_domains[@]} -eq 0 ] && { red "没有可用域名，已取消"; sleep 3; warp_manage; return; }
 
-    local domains_json
-    domains_json=$(printf '%s\n' "${ok_domains[@]}" | jq -R . | jq -s .)
+    local domains_json="[" dd
+    for dd in "${ok_domains[@]}"; do domains_json+="\"${dd}\","; done
+    domains_json="${domains_json%,}]"
 
     cp -f "$route_file" "${route_file}.bak"
-    jq_write "$route_file" --arg tag "$tag" --argjson domains "$domains_json" --arg addr "$pip_addr" '
+    jq_write "$route_file" --arg tag "$tag" --argjson domains "$domains_json" --arg addr "$pip_addr" --argjson pport "$pip_port" '
       .route.rule_set = ((.route.rule_set // []) + [{"tag":$tag,"type":"inline","rules":[{"domain_suffix":$domains}]}])
       | .route.rules = (
           [{"action":"sniff"}]
           + [ .route.rules[]? | select(.action != "sniff") ]
           + [
               {"rule_set":[$tag],"network":"udp","port":443,"action":"reject"},
-              {"rule_set":[$tag],"network":"tcp","port":443,"action":"route","outbound":"direct","override_address":$addr,"override_port":443}
+              {"rule_set":[$tag],"network":"tcp","port":443,"action":"route","outbound":"direct","override_address":$addr,"override_port":$pport}
             ]
         )'
 
@@ -247,7 +333,7 @@ add_proxyip_route() {
     rm -f "${route_file}.bak"
 
     reload_singbox
-    green "\n已添加 ProxyIP 分流 '${tag}' -> ${pip_addr}，域名: ${ok_domains[*]}"
+    green "\n已添加 ProxyIP 分流 '${tag}' -> ${pip_addr}:${pip_port}，域名: ${ok_domains[*]}"
     yellow "提示：已同时拦截这些域名的 UDP/443(QUIC)，让浏览器回退到 TCP，否则 QUIC 会绕过 ProxyIP。"
     yellow "验证：客户端连上节点后访问 https://chatgpt.com/cdn-cgi/trace 之类 (对应站点的 /cdn-cgi/trace)，查看 ip= 是否为 ProxyIP 的出口。"
     sleep 3; proxyip_menu
@@ -301,7 +387,7 @@ END { if (!(m && c && t)) exit 3 }
 sed -i 's/map(select(\. != "telegram-ip")) | \.\[\]/map(select(. != "telegram-ip")) | unique | .[]/' "$out" 2>/dev/null
 
 # 「已启用的分流规则集」列表：ProxyIP 规则显示 规则名 -> ProxyIP:地址，而不是 direct；匹配不到则不改动
-sed -i 's/\\(\$r\.outbound)"/\\(if $r.override_address != null then "ProxyIP:" + $r.override_address else $r.outbound end)"/' "$out" 2>/dev/null
+sed -i 's/\\(\$r\.outbound)"/\\(if $r.override_address != null then "ProxyIP:" + $r.override_address + ":" + ($r.override_port | tostring) else $r.outbound end)"/' "$out" 2>/dev/null
 
 bash -n "$out" 2>/dev/null || passthrough
 cat "$out"
