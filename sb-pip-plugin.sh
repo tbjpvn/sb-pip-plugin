@@ -1,6 +1,15 @@
 #!/bin/bash
 # =========================================================
-# sb-pip-plugin
+# sing-box.sh 插件：公共 ProxyIP 分流（单文件，用链接安装）
+#
+# 安装/更新: bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh)
+# 卸载:      bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh) -u
+#
+# 原理：sb 快捷指令每次都会从 GitHub 拉取最新主脚本运行，本机没有主脚本文件可改。
+#       安装时把 /etc/sing-box/sb.sh 换成带插件的版本：拉取主脚本 -> 自动在
+#       「WARP分流管理」菜单末尾追加本插件入口(序号=现有最大序号+1) -> 再运行。
+#       主脚本本身不被修改；插入失败时自动回退为原样运行。
+# 注意：只对 sb 命令生效；直接用链接运行主脚本时没有此菜单。
 # =========================================================
 export LANG=en_US.UTF-8
 work_dir="${SB_WORK_DIR:-/etc/sing-box}"
@@ -112,6 +121,66 @@ _pip_probe() {
     return 0
 }
 
+# 测延迟：$1=地址 $2=端口 $3=IP族 $4=次数(默认5)
+# 结果：pip_lat_avg(毫秒) pip_lat_max pip_lat_fail(超时次数) pip_lat_n
+_pip_latency() {
+    local h=$1 port=${2:-443} fam=$3 n=${4:-5} i out t ms sum=0 ok=0
+    [[ "$h" == *:* ]] && h="[${h}]"
+    pip_lat_n=$n; pip_lat_max=0; pip_lat_fail=0; pip_lat_avg=0
+    for ((i=1; i<=n; i++)); do
+        out=$(curl -s -o /dev/null $fam --connect-timeout 5 -m 8 --connect-to "www.cloudflare.com:443:${h}:${port}" \
+              -w '%{http_code} %{time_starttransfer}' https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+        if [ "${out%% *}" = "200" ]; then
+            ms=$(awk -v t="${out#* }" 'BEGIN{printf "%d", t*1000}')
+            sum=$((sum+ms)); ok=$((ok+1))
+            [ "$ms" -gt "$pip_lat_max" ] && pip_lat_max=$ms
+        else
+            pip_lat_fail=$((pip_lat_fail+1))
+        fi
+    done
+    [ "$ok" -gt 0 ] && pip_lat_avg=$((sum/ok))
+    return 0
+}
+
+# 按 pip_lat_* 评级：pip_rate_lv 0良好 1一般 2较差 3不可用
+_pip_rate() {
+    if [ "$pip_lat_fail" -ge $(( (pip_lat_n+1)/2 )) ]; then pip_rate_lv=3; pip_rate_txt="不可用 (超时过多)"
+    elif [ "$pip_lat_fail" -gt 0 ] || [ "$pip_lat_avg" -gt 1500 ]; then pip_rate_lv=2; pip_rate_txt="较差"
+    elif [ "$pip_lat_avg" -gt 600 ]; then pip_rate_lv=1; pip_rate_txt="一般"
+    else pip_rate_lv=0; pip_rate_txt="良好"; fi
+}
+
+_pip_show_latency() {
+    _pip_rate
+    local msg="延迟 平均 ${pip_lat_avg}ms  最高 ${pip_lat_max}ms  超时 ${pip_lat_fail}/${pip_lat_n}  评级: ${pip_rate_txt}"
+    [ "$pip_lat_fail" -ge "$pip_lat_n" ] && msg="延迟 全部超时 (${pip_lat_n}/${pip_lat_n})  评级: ${pip_rate_txt}"
+    case "$pip_rate_lv" in
+        0) green "  ${msg}" ;;
+        1) yellow "  ${msg}" ;;
+        *) red "  ${msg}" ;;
+    esac
+}
+
+# 测下载速度(约25MB，最多15秒)：$1=地址 $2=端口 $3=IP族 -> pip_dl_mbps (失败为空)
+_pip_download() {
+    local h=$1 port=${2:-443} fam=$3 sp
+    [[ "$h" == *:* ]] && h="[${h}]"
+    sp=$(curl -s -o /dev/null $fam --connect-timeout 5 -m 15 --connect-to "speed.cloudflare.com:443:${h}:${port}" \
+         -w '%{speed_download}' 'https://speed.cloudflare.com/__down?bytes=25000000' 2>/dev/null)
+    pip_dl_mbps=$(awk -v s="$sp" 'BEGIN{ if (s+0 > 0) printf "%.1f", s*8/1000000 }')
+}
+
+# 添加/更换前的质量检查：测5次延迟并显示；较差/不可用时询问是否仍要使用。0=继续 1=取消
+_pip_quality_gate() {
+    echo ""
+    yellow "正在测试延迟 (5次)..."
+    _pip_latency "$1" "$2" "$3" 5
+    _pip_show_latency
+    [ "$pip_rate_lv" -le 1 ] && return 0
+    reading "质量较差，仍要使用？(y/N): " q_go
+    [[ "$q_go" == "y" || "$q_go" == "Y" ]]
+}
+
 # 把所有 ProxyIP 规则改指向 $1(地址) $2(端口)：备份 -> 写入 -> 校验(失败回滚) -> 重载
 _pip_apply() {
     cp -f "$route_file" "${route_file}.bak"
@@ -160,6 +229,8 @@ _pip_cur_label() {
     done < <(_pip_bk_list)
     echo "${ca}:${cp}"
 }
+# 自动切换的过慢阈值(毫秒)，默认3000
+_pip_slow_ms() { local v; v=$(_pip_conf_get SLOW_MS); echo "${v:-3000}"; }
 # 服务器可用的 IP 族：优先 IPv4
 _pip_fam() { if [ -n "$(_pip_trace "" "" "-4")" ]; then echo -4; else echo -6; fi; }
 
@@ -224,6 +295,59 @@ _pip_watch_stop() {
     return 0
 }
 
+speedtest_proxyip_menu() {
+    clear
+    green "=== ProxyIP 测速 ===\n"
+    _pip_sync_conf
+    local names=() addrs=() ports=() a p j i=0 pa pp cur_label
+    pa=$(_pip_conf_get P_ADDR); pp=$(_pip_conf_get P_PORT)
+    cur_label=$(_pip_cur_label)
+    if [ -n "$pa" ]; then names+=("主"); addrs+=("$pa"); ports+=("${pp:-443}"); fi
+    while read -r a p; do
+        [ -z "$a" ] && continue
+        i=$((i+1)); names+=("备用${i}"); addrs+=("$a"); ports+=("${p:-443}")
+    done < <(_pip_bk_list)
+    for j in "${!names[@]}"; do
+        echo -e " $((j+1)). ${names[$j]}  ${addrs[$j]}:${ports[$j]}$([ "${names[$j]}" = "$cur_label" ] && echo '  (当前使用)')"
+    done
+    echo " a. 测试全部      c. 测试其他地址 (添加前先测一下)"
+    reading "\n输入序号 / a / c (回车返回): " sp_choice
+    local ta=() tp=() tn=() fam pip_addr pip_port
+    case "$sp_choice" in
+        "") proxyip_menu; return ;;
+        a|A)
+            [ ${#names[@]} -eq 0 ] && { yellow "还没有配置 ProxyIP"; sleep 2; speedtest_proxyip_menu; return; }
+            tn=("${names[@]}"); ta=("${addrs[@]}"); tp=("${ports[@]}") ;;
+        c|C)
+            reading "请输入要测试的 ProxyIP，可带端口 (默认443): " sp_in
+            [ -z "$sp_in" ] && { speedtest_proxyip_menu; return; }
+            sp_in=$(echo "$sp_in" | xargs)
+            if ! _pip_parse_addr "$sp_in"; then red "地址或端口格式无效"; sleep 2; speedtest_proxyip_menu; return; fi
+            tn=("待测"); ta=("$pip_addr"); tp=("${pip_port:-443}") ;;
+        *)
+            if ! [[ "$sp_choice" =~ ^[0-9]+$ ]] || [ "$sp_choice" -lt 1 ] || [ "$sp_choice" -gt "${#names[@]}" ]; then
+                red "无效的选择"; sleep 1; speedtest_proxyip_menu; return
+            fi
+            tn=("${names[$((sp_choice-1))]}"); ta=("${addrs[$((sp_choice-1))]}"); tp=("${ports[$((sp_choice-1))]}") ;;
+    esac
+    reading "是否同时测下载速度？(每个约15秒) (y/N): " sp_dl
+    fam=$(_pip_fam)
+    echo ""
+    for j in "${!tn[@]}"; do
+        echo -e "${tn[$j]}  ${ta[$j]}:${tp[$j]}"
+        _pip_latency "${ta[$j]}" "${tp[$j]}" "$fam" 8
+        _pip_show_latency
+        if [[ "$sp_dl" == "y" || "$sp_dl" == "Y" ]]; then
+            _pip_download "${ta[$j]}" "${tp[$j]}" "$fam"
+            if [ -n "$pip_dl_mbps" ]; then echo "  下载速度 约 ${pip_dl_mbps} Mbps"; else yellow "  下载测速失败"; fi
+        fi
+        echo ""
+    done
+    yellow "参考：聊天类(ChatGPT/Claude)主要看延迟，平均<600ms且无超时为良好；看视频才需要较高的下载速度。"
+    reading "按回车返回" sp_any
+    proxyip_menu
+}
+
 proxyip_menu() {
     route_file="${conf_dir}/route.json"
     _pip_sync_conf
@@ -255,6 +379,7 @@ proxyip_menu() {
     red   "2. 删除 ProxyIP 分流"
     yellow "3. 更换主 ProxyIP (保留规则，批量改地址/端口)"
     skyblue "4. 备用 ProxyIP / 自动切换"
+    green "5. 测速 (延迟 / 下载速度)"
     purple "0. 返回上级菜单"
     reading "请输入选择: " pip_menu_choice
     case "$pip_menu_choice" in
@@ -262,6 +387,7 @@ proxyip_menu() {
         2) delete_proxyip_route ;;
         3) change_proxyip_route ;;
         4) backup_proxyip_menu ;;
+        5) speedtest_proxyip_menu ;;
         0) warp_manage ;;
         *) red "无效选项"; sleep 1; proxyip_menu ;;
     esac
@@ -343,6 +469,7 @@ change_proxyip_route() {
         2) sleep 2; proxyip_menu; return ;;
         *) red "该 ProxyIP (${pip_addr}:${pip_port}) 不可用，已取消"; sleep 3; proxyip_menu; return ;;
     esac
+    _pip_quality_gate "$pip_addr" "$pip_port" "$fam" || { proxyip_menu; return; }
 
     _pip_apply "$pip_addr" "$pip_port" || { sleep 3; proxyip_menu; return; }
     _pip_conf_set P_ADDR "$pip_addr"; _pip_conf_set P_PORT "$pip_port"
@@ -378,10 +505,11 @@ backup_proxyip_menu() {
     echo ""
     green "1. 添加备用 ProxyIP (最多5个，按添加顺序优先)"
     red   "2. 删除备用 ProxyIP"
-    green "3. 开启自动切换 (主连续不通时切到可用备用，主恢复后自动切回)"
+    green "3. 开启自动切换 (主连续不通/过慢时切到可用备用，恢复后自动切回)"
     red   "4. 关闭自动切换"
     yellow "5. 手动切换 (主 / 备用)"
     skyblue "6. 查看切换日志"
+    yellow "7. 设置过慢阈值 (当前 $(_pip_slow_ms)ms：主 ProxyIP 持续慢于此值也视为故障)"
     purple "0. 返回"
     reading "请输入选择: " bk_choice
     local pip_addr pip_port fam direct_info pip_info pip_in
@@ -424,6 +552,7 @@ backup_proxyip_menu() {
                 red "该 ProxyIP 的出口 IP (${new_ip}) 和 ${dup} 相同，属于同一个源，不能当备用。"
                 sleep 4; backup_proxyip_menu; return
             fi
+            _pip_quality_gate "$pip_addr" "$pip_port" "$fam" || { backup_proxyip_menu; return; }
             echo "${pip_addr} ${pip_port}" >> "$(_pip_bkf)"
             green "\n已添加备用 ProxyIP: ${pip_addr}:${pip_port} (备用$((n+1)))"
             if [ "$(_pip_watch_state)" != "运行中" ]; then
@@ -498,6 +627,15 @@ backup_proxyip_menu() {
             echo ""
             reading "按回车返回" bk_any
             backup_proxyip_menu ;;
+        7)
+            reading "请输入阈值，毫秒 (500-20000，默认3000，回车返回): " bk_slow
+            [ -z "$bk_slow" ] && { backup_proxyip_menu; return; }
+            if ! [[ "$bk_slow" =~ ^[0-9]+$ ]] || [ "$bk_slow" -lt 500 ] || [ "$bk_slow" -gt 20000 ]; then
+                red "请输入 500-20000 之间的整数"; sleep 2; backup_proxyip_menu; return
+            fi
+            _pip_conf_set SLOW_MS "$bk_slow"
+            green "已设置：首字节延迟持续超过 ${bk_slow}ms 视为过慢"
+            sleep 2; backup_proxyip_menu ;;
         *) proxyip_menu ;;
     esac
 }
@@ -547,6 +685,10 @@ add_proxyip_route() {
         yellow "\n两者出口IP相同：该 ProxyIP 没有改变出口，分流没有意义。"
         reading "仍要继续？(y/N): " go_on
         [[ "$go_on" == "y" || "$go_on" == "Y" ]] || { warp_manage; return; }
+    fi
+
+    if [ "$reuse" -eq 0 ]; then
+        _pip_quality_gate "$pip_addr" "$pip_port" "$fam" || { warp_manage; return; }
     fi
 
     echo ""
@@ -731,17 +873,26 @@ net_ok() {
     done
     return 1
 }
-# probe 地址 端口：2 次尝试，任意一次拿到 CF trace 即视为可用
+# probe 地址 端口：2 次尝试，任意一次拿到 HTTP 200 即视为可通；probe_ms 记下首字节耗时(毫秒)，失败为0
+probe_ms=0
 probe() {
-    local host=$1 port=$2 i
+    local host=$1 port=$2 i out t
     [[ "$host" == *:* ]] && host="[${host}]"
     for i in 1 2; do
-        curl -s $fam --connect-timeout 5 -m 8 --connect-to "www.cloudflare.com:443:${host}:${port}" \
-            https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^ip=' && return 0
+        out=$(curl -s $fam --connect-timeout 5 -m 8 --connect-to "www.cloudflare.com:443:${host}:${port}" \
+              -w '\n%{http_code} %{time_starttransfer}' https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+        t=${out##*$'\n'}
+        if [ "${t%% *}" = "200" ]; then
+            probe_ms=$(awk -v t="${t#* }" 'BEGIN{printf "%d", t*1000}'); return 0
+        fi
         [ "$i" -eq 1 ] && sleep 3
     done
-    return 1
+    probe_ms=0; return 1
 }
+# 健康 = 可通 且 首字节延迟不超过阈值(SLOW_MS)
+SLOW_MS=3000
+good() { probe "$1" "$2" && [ "$probe_ms" -le "$SLOW_MS" ]; }
+ms_txt() { if [ "$probe_ms" -gt 0 ]; then echo "过慢 ${probe_ms}ms"; else echo "不通"; fi; }
 has_rules() {
     jq -e '[.route.rules[]? | select(.override_address != null)] | length > 0' "$route_file" >/dev/null 2>&1
 }
@@ -791,7 +942,7 @@ try_backups() {
     local i
     for i in "${!bka[@]}"; do
         [ "${bka[$i]}" = "$1" ] && [ "${bkp[$i]}" = "$2" ] && continue
-        if probe "${bka[$i]}" "${bkp[$i]}"; then
+        if good "${bka[$i]}" "${bkp[$i]}"; then
             switch_to "${bka[$i]}" "${bkp[$i]}" "已切换到备用$((i+1))" && return 0
         fi
     done
@@ -803,6 +954,7 @@ tick() {
     pa=$(get P_ADDR); pp=$(get P_PORT); ca=$(get CUR_ADDR); cp=$(get CUR_PORT)
     [ -n "$pa" ] || return 0
     pp=${pp:-443}; ca=${ca:-$pa}; cp=${cp:-$pp}
+    SLOW_MS=$(get SLOW_MS); SLOW_MS=${SLOW_MS:-${PIP_SLOW_MS:-3000}}
     load_backups
     [ ${#bka[@]} -gt 0 ] || return 0
     has_rules || return 0
@@ -811,25 +963,25 @@ tick() {
 
     if [ "$ca" = "$pa" ] && [ "$cp" = "$pp" ]; then
         # 正在用主 ProxyIP
-        if probe "$pa" "$pp"; then put FAILS 0; return 0; fi
+        if good "$pa" "$pp"; then put FAILS 0; return 0; fi
         fails=$((fails+1)); put FAILS "$fails"
-        log "主 ProxyIP ${pa}:${pp} 不通 (${fails}/${FAIL_LIMIT})"
+        log "主 ProxyIP ${pa}:${pp} $(ms_txt) (${fails}/${FAIL_LIMIT})"
         if [ "$fails" -ge "$FAIL_LIMIT" ]; then
-            try_backups "" "" || log "所有备用 ProxyIP 都不通，保持不变"
+            try_backups "" "" || log "所有备用 ProxyIP 都不通或过慢，保持不变"
         fi
     else
         # 正在用某个备用
-        if ! probe "$ca" "$cp"; then
+        if ! good "$ca" "$cp"; then
             # 当前备用坏了：主如果可用就切回，否则换下一个可用备用
-            if probe "$pa" "$pp"; then
-                switch_to "$pa" "$pp" "当前备用不通，主 ProxyIP 可用，已切回主"
+            if good "$pa" "$pp"; then
+                switch_to "$pa" "$pp" "当前备用不通或过慢，主 ProxyIP 可用，已切回主"
             else
                 try_backups "$ca" "$cp" || log "主、备 ProxyIP 均不通"
             fi
             return 0
         fi
         # 当前备用正常：看主是否恢复
-        if probe "$pa" "$pp"; then
+        if good "$pa" "$pp"; then
             oks=$((oks+1)); put OKS "$oks"
             if [ "$oks" -ge "$BACK_LIMIT" ]; then
                 switch_to "$pa" "$pp" "主 ProxyIP 已恢复，切回主"
