@@ -316,7 +316,7 @@ _pip_hist_show() {
         addr_s="$a"; [[ "$a" == *:* ]] && addr_s="[${a}]"
         if [ "$f" -ge "$n" ] 2>/dev/null; then lat_s="全部超时(${f}/${n})"; else lat_s="平均${avg}ms 最高${mx}ms 超时${f}/${n}"; fi
         if [ -z "$dl" ] || [ "$dl" = "-" ]; then dl_s="下载 未测"; else dl_s="下载 ${dl}Mbps"; fi
-        echo -e " ${green}h${i}.${re} ${yellow}${addr_s}:${p}${re}  ${lat_s}  ${dl_s}  ${t}"
+        echo -e " ${skyblue}${i}.${re} ${yellow}${addr_s}:${p}${re}  ${lat_s}  ${dl_s}  ${t}"
     done < "$(_pip_hf)"
 }
 
@@ -329,17 +329,17 @@ _pip_hist_get() {
     echo "${a}:${p}"
 }
 
-# 读取 ProxyIP 输入；有测速记录时先列出，可输入 h1-h5 直接选用。结果写入变量名 $2
+# 读取 ProxyIP 输入；有测速记录时先列出，可输入序号 1-5 直接选用。结果写入变量名 $2
 _pip_read_addr() {
     local prompt=$1 pip_rd_v pip_rd_rec
     if [ -s "$(_pip_hf)" ]; then
         echo ""
-        green "最近测速记录 (输入 h1-h5 可直接选用):"
+        green "最近测速记录 (输入序号 1-5 可直接选用):"
         _pip_hist_show
         echo ""
     fi
     reading "$prompt" pip_rd_v
-    if [[ "$pip_rd_v" =~ ^[hH]([1-5])$ ]]; then
+    if [[ "$pip_rd_v" =~ ^([1-5])$ ]]; then
         pip_rd_rec=$(_pip_hist_get "${BASH_REMATCH[1]}")
         if [ -z "$pip_rd_rec" ]; then red "没有这条测速记录"; pip_rd_v=""
         else pip_rd_v=$pip_rd_rec; green "已选用 ${pip_rd_v}"; fi
@@ -372,7 +372,7 @@ speedtest_proxyip_menu() {
     fi
     if [ -s "$(_pip_hf)" ]; then
         echo ""
-        green "最近测速记录 (最多5条，输入 h1-h5 可重新测试):"
+        green "最近测速记录 (最多5条，仅供查看；设置主/备用 ProxyIP 时输入对应序号可直接选用):"
         _pip_hist_show
     fi
     echo ""
@@ -408,11 +408,6 @@ speedtest_proxyip_menu() {
             tn=("${names[@]}"); ta=("${addrs[@]}"); tp=("${ports[@]}") ;;
         x|X)
             rm -f "$(_pip_hf)"; green "已清空测速记录"; sleep 1; speedtest_proxyip_menu; return ;;
-        h[1-5]|H[1-5])
-            rec=$(_pip_hist_get "${sp_choice:1}")
-            [ -z "$rec" ] && { red "没有这条测速记录"; sleep 1; speedtest_proxyip_menu; return; }
-            _pip_parse_addr "$rec" || { red "记录格式异常"; sleep 1; speedtest_proxyip_menu; return; }
-            tn=("记录${sp_choice:1}"); ta=("$pip_addr"); tp=("${pip_port:-443}") ;;
         *)
             if ! [[ "$sp_choice" =~ ^[0-9]+$ ]] || [ "$sp_choice" -lt 1 ] || [ "$sp_choice" -gt "${#names[@]}" ]; then
                 red "无效的选择"; sleep 1; speedtest_proxyip_menu; return
