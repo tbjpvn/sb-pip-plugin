@@ -1,6 +1,15 @@
 #!/bin/bash
 # =========================================================
-# sb-pip-plugin
+# sing-box.sh 插件：公共 ProxyIP 分流（单文件，用链接安装）
+#
+# 安装/更新: bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh)
+# 卸载:      bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh) -u
+#
+# 原理：sb 快捷指令每次都会从 GitHub 拉取最新主脚本运行，本机没有主脚本文件可改。
+#       安装时把 /etc/sing-box/sb.sh 换成带插件的版本：拉取主脚本 -> 自动在
+#       「WARP分流管理」菜单末尾追加本插件入口(序号=现有最大序号+1) -> 再运行。
+#       主脚本本身不被修改；插入失败时自动回退为原样运行。
+# 注意：只对 sb 命令生效；直接用链接运行主脚本时没有此菜单。
 # =========================================================
 export LANG=en_US.UTF-8
 work_dir="${SB_WORK_DIR:-/etc/sing-box}"
@@ -286,6 +295,61 @@ _pip_watch_stop() {
     return 0
 }
 
+# 测速记录：最近5条，proxyip.history，每行 地址<TAB>端口<TAB>平均ms<TAB>最高ms<TAB>超时<TAB>次数<TAB>下载Mbps(未测为-)<TAB>时间
+_pip_hf() { echo "${work_dir}/plugins/proxyip.history"; }
+
+# $1=地址 $2=端口 $3=平均ms $4=最高ms $5=超时 $6=次数 $7=下载Mbps(可空)；同一地址端口只保留最新一条
+_pip_hist_add() {
+    local hf; hf=$(_pip_hf)
+    mkdir -p "$(dirname "$hf")"
+    {
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "${7:--}" "$(date '+%m-%d %H:%M')"
+        [ -f "$hf" ] && awk -F'\t' -v a="$1" -v p="$2" '!($1==a && $2==p)' "$hf"
+    } | head -n 5 > "${hf}.tmp" && mv -f "${hf}.tmp" "$hf"
+}
+
+_pip_hist_show() {
+    local i=0 a p avg mx f n dl t addr_s lat_s dl_s
+    while IFS=$'\t' read -r a p avg mx f n dl t; do
+        [ -z "$a" ] && continue
+        i=$((i+1))
+        addr_s="$a"; [[ "$a" == *:* ]] && addr_s="[${a}]"
+        if [ "$f" -ge "$n" ] 2>/dev/null; then lat_s="全部超时(${f}/${n})"; else lat_s="平均${avg}ms 最高${mx}ms 超时${f}/${n}"; fi
+        if [ -z "$dl" ] || [ "$dl" = "-" ]; then dl_s="下载 未测"; else dl_s="下载 ${dl}Mbps"; fi
+        echo -e " ${green}h${i}.${re} ${yellow}${addr_s}:${p}${re}  ${lat_s}  ${dl_s}  ${t}"
+    done < "$(_pip_hf)"
+}
+
+# $1=序号(1-5) -> 输出 "地址:端口"(IPv6 带方括号)，没有则无输出
+_pip_hist_get() {
+    local a p
+    IFS=$'\t' read -r a p _ < <(sed -n "${1}p" "$(_pip_hf)" 2>/dev/null)
+    [ -z "$a" ] && return 0
+    [[ "$a" == *:* ]] && a="[${a}]"
+    echo "${a}:${p}"
+}
+
+# 读取 ProxyIP 输入；有测速记录时先列出，可输入 h1-h5 直接选用。结果写入变量名 $2
+_pip_read_addr() {
+    local prompt=$1 pip_rd_v pip_rd_rec
+    if [ -s "$(_pip_hf)" ]; then
+        echo ""
+        green "最近测速记录 (输入 h1-h5 可直接选用):"
+        _pip_hist_show
+        echo ""
+    fi
+    reading "$prompt" pip_rd_v
+    if [[ "$pip_rd_v" =~ ^[hH]([1-5])$ ]]; then
+        pip_rd_rec=$(_pip_hist_get "${BASH_REMATCH[1]}")
+        if [ -z "$pip_rd_rec" ]; then red "没有这条测速记录"; pip_rd_v=""
+        else pip_rd_v=$pip_rd_rec; green "已选用 ${pip_rd_v}"; fi
+    fi
+    printf -v "$2" '%s' "$pip_rd_v"
+}
+
+# 显示用 地址:端口 (IPv6 加方括号)
+_pip_hostport() { if [[ "$1" == *:* ]]; then echo "[$1]:$2"; else echo "$1:$2"; fi; }
+
 speedtest_proxyip_menu() {
     clear
     green "=== ProxyIP 测速 ===\n"
@@ -298,23 +362,57 @@ speedtest_proxyip_menu() {
         [ -z "$a" ] && continue
         i=$((i+1)); names+=("备用${i}"); addrs+=("$a"); ports+=("${p:-443}")
     done < <(_pip_bk_list)
-    for j in "${!names[@]}"; do
-        echo -e " $((j+1)). ${names[$j]}  ${addrs[$j]}:${ports[$j]}$([ "${names[$j]}" = "$cur_label" ] && echo '  (当前使用)')"
-    done
-    echo " a. 测试全部      c. 测试其他地址 (添加前先测一下)"
-    reading "\n输入序号 / a / c (回车返回): " sp_choice
-    local ta=() tp=() tn=() fam pip_addr pip_port
+    if [ ${#names[@]} -gt 0 ]; then
+        green "当前配置:"
+        for j in "${!names[@]}"; do
+            echo -e " ${green}$((j+1)). ${names[$j]}${re}  ${yellow}$(_pip_hostport "${addrs[$j]}" "${ports[$j]}")${re}$([ "${names[$j]}" = "$cur_label" ] && echo '  (当前使用)')"
+        done
+    else
+        yellow "还没有配置 ProxyIP"
+    fi
+    if [ -s "$(_pip_hf)" ]; then
+        echo ""
+        green "最近测速记录 (最多5条，输入 h1-h5 可重新测试):"
+        _pip_hist_show
+    fi
+    echo ""
+    echo -e " ${green}回车. 测试其他地址${re}"
+    echo -e " ${green}7. 批量测试其他地址 (域名/IP[:端口]，空格分隔，不写端口默认443)${re}"
+    echo -e " ${green}8. 测试全部配置${re}"
+    echo -e " ${green}x. 清空测速记录${re}"
+    echo -e " ${purple}0. 返回上级菜单${re}"
+    reading "请输入序号 (回车=测试其他地址): " sp_choice
+    local ta=() tp=() tn=() fam pip_addr pip_port rec tok k=0
     case "$sp_choice" in
-        "") proxyip_menu; return ;;
-        a|A)
-            [ ${#names[@]} -eq 0 ] && { yellow "还没有配置 ProxyIP"; sleep 2; speedtest_proxyip_menu; return; }
-            tn=("${names[@]}"); ta=("${addrs[@]}"); tp=("${ports[@]}") ;;
-        c|C)
-            reading "请输入要测试的 ProxyIP，可带端口 (默认443): " sp_in
+        0) proxyip_menu; return ;;
+        "")
+            reading "请输入要测试的 ProxyIP，可带端口 (默认443，回车返回本页): " sp_in
             [ -z "$sp_in" ] && { speedtest_proxyip_menu; return; }
             sp_in=$(echo "$sp_in" | xargs)
             if ! _pip_parse_addr "$sp_in"; then red "地址或端口格式无效"; sleep 2; speedtest_proxyip_menu; return; fi
             tn=("待测"); ta=("$pip_addr"); tp=("${pip_port:-443}") ;;
+        7)
+            reading "请输入多个地址，空格分隔，不写端口默认443 (如: a.com b.com:8443 1.2.3.4，回车返回本页): " sp_in
+            [ -z "$sp_in" ] && { speedtest_proxyip_menu; return; }
+            for tok in $sp_in; do
+                if _pip_parse_addr "$tok"; then
+                    if [ "$k" -ge 10 ]; then yellow "一次最多测10个，多出的已忽略"; break; fi
+                    k=$((k+1)); tn+=("批量${k}"); ta+=("$pip_addr"); tp+=("${pip_port:-443}")
+                else
+                    yellow "跳过无效地址: $tok"
+                fi
+            done
+            [ ${#ta[@]} -eq 0 ] && { red "没有有效地址"; sleep 2; speedtest_proxyip_menu; return; } ;;
+        8)
+            [ ${#names[@]} -eq 0 ] && { yellow "还没有配置 ProxyIP"; sleep 2; speedtest_proxyip_menu; return; }
+            tn=("${names[@]}"); ta=("${addrs[@]}"); tp=("${ports[@]}") ;;
+        x|X)
+            rm -f "$(_pip_hf)"; green "已清空测速记录"; sleep 1; speedtest_proxyip_menu; return ;;
+        h[1-5]|H[1-5])
+            rec=$(_pip_hist_get "${sp_choice:1}")
+            [ -z "$rec" ] && { red "没有这条测速记录"; sleep 1; speedtest_proxyip_menu; return; }
+            _pip_parse_addr "$rec" || { red "记录格式异常"; sleep 1; speedtest_proxyip_menu; return; }
+            tn=("记录${sp_choice:1}"); ta=("$pip_addr"); tp=("${pip_port:-443}") ;;
         *)
             if ! [[ "$sp_choice" =~ ^[0-9]+$ ]] || [ "$sp_choice" -lt 1 ] || [ "$sp_choice" -gt "${#names[@]}" ]; then
                 red "无效的选择"; sleep 1; speedtest_proxyip_menu; return
@@ -324,19 +422,31 @@ speedtest_proxyip_menu() {
     reading "是否同时测下载速度？(每个约15秒) (y/N): " sp_dl
     fam=$(_pip_fam)
     echo ""
+    local dl_rec key hp sum_lines=()
     for j in "${!tn[@]}"; do
-        echo -e "${tn[$j]}  ${ta[$j]}:${tp[$j]}"
+        hp=$(_pip_hostport "${ta[$j]}" "${tp[$j]}")
+        echo -e "${green}${tn[$j]}${re}  ${yellow}${hp}${re}"
         _pip_latency "${ta[$j]}" "${tp[$j]}" "$fam" 8
         _pip_show_latency
+        dl_rec=""
         if [[ "$sp_dl" == "y" || "$sp_dl" == "Y" ]]; then
+            pip_dl_mbps=""
             _pip_download "${ta[$j]}" "${tp[$j]}" "$fam"
-            if [ -n "$pip_dl_mbps" ]; then echo "  下载速度 约 ${pip_dl_mbps} Mbps"; else yellow "  下载测速失败"; fi
+            if [ -n "$pip_dl_mbps" ]; then echo "  下载速度 约 ${pip_dl_mbps} Mbps"; dl_rec=$pip_dl_mbps; else yellow "  下载测速失败"; fi
         fi
+        _pip_hist_add "${ta[$j]}" "${tp[$j]}" "$pip_lat_avg" "$pip_lat_max" "$pip_lat_fail" "$pip_lat_n" "$dl_rec"
+        key=$pip_lat_avg; [ "$pip_lat_fail" -ge "$pip_lat_n" ] && key=999999
+        sum_lines+=("${key}"$'\t'"${green}${tn[$j]}${re} ${yellow}${hp}${re}  $(_pip_rate; echo "${pip_rate_txt}")  平均${pip_lat_avg}ms 超时${pip_lat_fail}/${pip_lat_n}  下载 ${dl_rec:-未测}")
         echo ""
     done
+    if [ ${#ta[@]} -ge 2 ]; then
+        green "汇总 (按平均延迟从小到大，全部超时的排最后):"
+        printf '%s\n' "${sum_lines[@]}" | sort -t$'\t' -k1,1n | cut -f2- | while IFS= read -r sl; do echo -e " ${sl}"; done
+        echo ""
+    fi
     yellow "参考：聊天类(ChatGPT/Claude)主要看延迟，平均<600ms且无超时为良好；看视频才需要较高的下载速度。"
-    reading "按回车返回" sp_any
-    proxyip_menu
+    reading "按回车返回测速页面" sp_any
+    speedtest_proxyip_menu
 }
 
 proxyip_menu() {
@@ -448,7 +558,7 @@ change_proxyip_route() {
     fi
     yellow "把所有 ProxyIP 分流规则改指向新的 ProxyIP(域名列表不变)，并设为主 ProxyIP。"
     local pip_addr pip_port fam direct_info pip_info pip_in
-    reading "请输入新的 ProxyIP，可带端口，如 tw.william.us.ci:8443 (不写端口默认443，回车返回): " pip_in
+    _pip_read_addr "请输入新的 ProxyIP，可带端口，如 tw.william.us.ci:8443 (不写端口默认443，回车返回): " pip_in
     [ -z "$pip_in" ] && { proxyip_menu; return; }
     pip_in=$(echo "$pip_in" | xargs)
     if ! _pip_parse_addr "$pip_in"; then
@@ -507,7 +617,7 @@ backup_proxyip_menu() {
     case "$bk_choice" in
         1)
             if [ "$n" -ge 5 ]; then red "最多添加 5 个备用"; sleep 2; backup_proxyip_menu; return; fi
-            reading "请输入备用 ProxyIP，可带端口 (不写端口默认443，回车返回): " pip_in
+            _pip_read_addr "请输入备用 ProxyIP，可带端口 (不写端口默认443，回车返回): " pip_in
             [ -z "$pip_in" ] && { backup_proxyip_menu; return; }
             pip_in=$(echo "$pip_in" | xargs)
             if ! _pip_parse_addr "$pip_in"; then
@@ -655,7 +765,7 @@ add_proxyip_route() {
         [ -z "$pip_addr" ] && { pip_addr=$(_pip_conf_get P_ADDR); pip_port=$(_pip_conf_get P_PORT); }
         yellow "已有 ProxyIP 分流，新规则沿用当前 ProxyIP: ${pip_addr}:${pip_port:-443}"
     else
-        reading "请输入 ProxyIP，可带端口，如 tw.william.us.ci 或 tw.william.us.ci:8443 (不写端口默认443，回车返回): " pip_in
+        _pip_read_addr "请输入 ProxyIP，可带端口，如 tw.william.us.ci 或 tw.william.us.ci:8443 (不写端口默认443，回车返回): " pip_in
         [ -z "$pip_in" ] && { warp_manage; return; }
         pip_in=$(echo "$pip_in" | xargs)
         if ! _pip_parse_addr "$pip_in"; then
@@ -1039,7 +1149,9 @@ install_plugin() {
     fi
     echo "$url" > "${plugin_dir}/main_url"
     write_wrapper "$url"
-    [ -e /usr/bin/sb ] || { [ -z "$SB_WORK_DIR" ] && ln -sf "$wrapper" /usr/bin/sb; }
+    if [ ! -e /usr/bin/sb ] && [ -z "$SB_WORK_DIR" ]; then
+        ln -sf "$wrapper" /usr/bin/sb && touch "${plugin_dir}/sb_link_created"
+    fi
 
     # 更新插件时，自动切换服务若在运行则重启以使用新脚本
     if [ -z "$SB_WORK_DIR" ] && command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet sb-proxyip 2>/dev/null; then
@@ -1060,33 +1172,93 @@ install_plugin() {
     yellow "提示：主脚本重新安装/卸载会重置 sb 快捷指令，届时重新运行本安装链接即可。"
 }
 
+# 清理本插件添加的 ProxyIP 分流规则(pip- 开头的规则集及其路由规则)；先备份，sing-box 校验失败则回滚
+remove_pip_rules() {
+    local rf="${work_dir}/conf/route.json"
+    [ -f "$rf" ] || return 0
+    command -v jq >/dev/null 2>&1 || { yellow "缺少 jq，无法自动清理 pip- 开头的分流规则，请手动检查 ${rf}"; return 0; }
+    if ! jq -e '([.route.rule_set[]? | select((.tag // "") | startswith("pip-"))] | length > 0) or ([.route.rules[]? | select(.override_address != null)] | length > 0)' "$rf" >/dev/null 2>&1; then
+        return 0
+    fi
+    cp -f "$rf" "${rf}.pipbak"
+    if ! jq '
+        .route.rules = [ .route.rules[]? | select((.override_address == null) and (((.rule_set // []) | map(select(startswith("pip-"))) | length) == 0)) ]
+        | if .route.rule_set then .route.rule_set = [ .route.rule_set[] | select(((.tag // "") | startswith("pip-")) | not) ] else . end
+      ' "${rf}.pipbak" > "${rf}.piptmp"; then
+        rm -f "${rf}.piptmp" "${rf}.pipbak"; red "清理 ProxyIP 规则失败，已保持原配置不变"; return 1
+    fi
+    mv -f "${rf}.piptmp" "$rf"
+    if [ -x "${work_dir}/sing-box" ] && ! "${work_dir}/sing-box" check -C "${work_dir}/conf" >/dev/null 2>&1; then
+        mv -f "${rf}.pipbak" "$rf"; red "清理后配置校验未通过，已回滚，请手动处理 pip- 开头的分流规则"; return 1
+    fi
+    rm -f "${rf}.pipbak"
+    if [ -z "$SB_WORK_DIR" ]; then
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl reload sing-box 2>/dev/null || systemctl restart sing-box
+        elif command -v rc-service >/dev/null 2>&1; then
+            rc-service sing-box restart >/dev/null 2>&1
+        fi
+    fi
+    green "已清理 ProxyIP 分流规则并重载 sing-box"
+}
+
 uninstall_plugin() {
-    [ -f "$wrapper" ] || { yellow "未找到 sb 快捷指令，无需卸载"; exit 0; }
     local url
     url=$(cat "${plugin_dir}/main_url" 2>/dev/null)
-    if [ -f "${wrapper}.orig" ]; then
-        mv -f "${wrapper}.orig" "$wrapper"
-    elif [ -n "$url" ]; then
-        printf '#!/usr/bin/env bash\nbash <(curl -Ls %s) $1\n' "$url" > "$wrapper"
-    fi
-    chmod +x "$wrapper"
+
+    # 1) 停止并删除自动切换服务
     if [ -z "$SB_WORK_DIR" ]; then
         if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/sb-proxyip.service ]; then
             systemctl disable --now sb-proxyip >/dev/null 2>&1
             rm -f /etc/systemd/system/sb-proxyip.service
             systemctl daemon-reload >/dev/null 2>&1
+            systemctl reset-failed sb-proxyip >/dev/null 2>&1
         fi
         if command -v rc-service >/dev/null 2>&1 && [ -f /etc/init.d/sb-proxyip ]; then
             rc-service sb-proxyip stop >/dev/null 2>&1
             rc-update del sb-proxyip default >/dev/null 2>&1
-            rm -f /etc/init.d/sb-proxyip
+            rm -f /etc/init.d/sb-proxyip /var/run/sb-proxyip.pid
         fi
     fi
-    rm -f "${plugin_dir}/proxyip.sh" "${plugin_dir}/proxyip-inject.sh" "${plugin_dir}/proxyip-watch.sh" "${plugin_dir}/proxyip.conf" "${plugin_dir}/proxyip.backups" "${plugin_dir}/proxyip-watch.log" "${plugin_dir}/main_url"
+
+    # 2) 清理本插件添加的 ProxyIP 分流规则
+    remove_pip_rules
+
+    # 3) 还原 sb 快捷指令 (只处理带本插件标记的 sb.sh；主脚本重装后重建的 sb.sh 不动)
+    if [ -f "$wrapper" ] && grep -q "$wrapper_marker" "$wrapper"; then
+        if [ -f "${wrapper}.orig" ]; then
+            mv -f "${wrapper}.orig" "$wrapper"
+        elif [ -n "$url" ]; then
+            printf '#!/usr/bin/env bash\nbash <(curl -Ls %s) $1\n' "$url" > "$wrapper"
+        else
+            red "无法还原 sb.sh (缺少备份和主脚本地址)，请用主脚本重新安装以重建 sb 快捷指令"
+        fi
+        chmod +x "$wrapper"
+    else
+        rm -f "${wrapper}.orig"
+    fi
+    # 本插件创建过 /usr/bin/sb 链接才删除；原来就有的不动
+    if [ -z "$SB_WORK_DIR" ] && [ -f "${plugin_dir}/sb_link_created" ] && [ -L /usr/bin/sb ]; then
+        rm -f /usr/bin/sb
+    fi
+
+    # 4) 删除插件文件
+    rm -f "${plugin_dir}/proxyip.sh" "${plugin_dir}/proxyip-inject.sh" "${plugin_dir}/proxyip-watch.sh" "${plugin_dir}/proxyip-watch.sh.tmp" \
+          "${plugin_dir}/proxyip.conf" "${plugin_dir}/proxyip.backups" "${plugin_dir}/proxyip.history" "${plugin_dir}/proxyip-watch.log" \
+          "${plugin_dir}/proxyip-watch.log.tmp" "${plugin_dir}/main_url" "${plugin_dir}/sb_link_created"
     rmdir "$plugin_dir" 2>/dev/null
-    green "已卸载 ProxyIP 分流插件，sb 快捷指令已恢复。"
-    yellow "已添加的 ProxyIP 分流规则(名称以 pip- 开头)仍保留在配置里继续生效，"
-    yellow "如需删除，请到 sb -> 10 -> 2(删除分流服务) 中删除。"
+
+    # 5) 残留检查
+    local left=""
+    [ -f "${wrapper}.orig" ] && left+=" ${wrapper}.orig"
+    [ -d "$plugin_dir" ] && ls "$plugin_dir" 2>/dev/null | grep -q 'proxyip' && left+=" ${plugin_dir}/proxyip*"
+    [ -z "$SB_WORK_DIR" ] && { [ -f /etc/systemd/system/sb-proxyip.service ] || [ -f /etc/init.d/sb-proxyip ]; } && left+=" sb-proxyip 服务文件"
+    [ -f "${work_dir}/conf/route.json" ] && grep -q '"pip-' "${work_dir}/conf/route.json" 2>/dev/null && left+=" route.json 中的 pip- 规则"
+    if [ -z "$left" ]; then
+        green "已卸载 ProxyIP 分流插件，所有相关文件、服务和分流规则都已清理，sb 快捷指令已还原。"
+    else
+        yellow "已卸载，但仍有残留需要手动处理:${left}"
+    fi
 }
 
 case "$1" in
