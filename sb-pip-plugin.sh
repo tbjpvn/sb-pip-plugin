@@ -1,15 +1,6 @@
 #!/bin/bash
 # =========================================================
-# sing-box.sh 插件：公共 ProxyIP 分流（单文件，用链接安装）
-#
-# 安装/更新: bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh)
-# 卸载:      bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh) -u
-#
-# 原理：sb 快捷指令每次都会从 GitHub 拉取最新主脚本运行，本机没有主脚本文件可改。
-#       安装时把 /etc/sing-box/sb.sh 换成带插件的版本：拉取主脚本 -> 自动在
-#       「WARP分流管理」菜单末尾追加本插件入口(序号=现有最大序号+1) -> 再运行。
-#       主脚本本身不被修改；插入失败时自动回退为原样运行。
-# 注意：只对 sb 命令生效；直接用链接运行主脚本时没有此菜单。
+# sb-pip-plugin
 # =========================================================
 export LANG=en_US.UTF-8
 work_dir="${SB_WORK_DIR:-/etc/sing-box}"
@@ -106,8 +97,60 @@ _pip_parse_addr() {
 
 # 检测 ProxyIP 是否可用(端口缺省443)；读取 pip_addr/pip_port，设置 fam direct_info pip_info
 # 返回 0=可用 1=该 ProxyIP 不可用 2=服务器自身访问不了 cloudflare.com
+# 公共 NAT64 前缀 (nat64.net / Kasper Dupont，均为 /96，来源 nat64.xyz)
+_pip_nat64_prefixes() { echo "2a00:1098:2b:: 2a00:1098:2c:1:: 2a01:4f8:c2c:123f:64:: 2a01:4f9:c010:3f02:64::"; }
+
+# 取 ProxyIP 的 IPv4：本身是 IPv4 就直接用；域名则解析 A 记录
+_pip_v4_of() {
+    local h=$1 v
+    local r_v4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    [[ "$h" =~ $r_v4 ]] && { echo "$h"; return 0; }
+    v=$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1; exit}')
+    [[ "$v" =~ $r_v4 ]] || v=$(dig +short A "$h" 2>/dev/null | grep -E "$r_v4" | head -1)
+    [[ "$v" =~ $r_v4 ]] || v=$(host -t A "$h" 2>/dev/null | awk '/has address/{print $4; exit}')
+    [[ "$v" =~ $r_v4 ]] && echo "$v"
+    return 0
+}
+
+# 前缀($1) + IPv4($2) -> 合成的 IPv6 地址
+_pip_synth() {
+    local a b c d
+    IFS=. read -r a b c d <<< "$2"
+    printf '%s%02x%02x:%02x%02x' "$1" "$a" "$b" "$c" "$d"
+}
+
+# 依次用公共 NAT64 前缀测试：$1=地址(域名或IPv4) $2=端口 $3=IP族；成功则输出可用的合成地址
+_pip_nat64_find() {
+    local v4 pfx cand
+    v4=$(_pip_v4_of "$1"); [ -z "$v4" ] && return 1
+    for pfx in $(_pip_nat64_prefixes); do
+        cand=$(_pip_synth "$pfx" "$v4")
+        if [ -n "$(_pip_trace "" "$cand" "$3" "${2:-443}")" ]; then echo "$cand"; return 0; fi
+    done
+    return 1
+}
+
+# 合成地址 <-> 原域名 对照 (仅用于显示，方便知道这个 IPv6 地址是谁)
+_pip_nf() { echo "${work_dir}/plugins/proxyip.nat64"; }
+_pip_nat64_save() {   # $1=合成地址 $2=原域名/IPv4
+    local f; f=$(_pip_nf)
+    mkdir -p "$(dirname "$f")"
+    { awk -F'\t' -v a="$1" '$1!=a' "$f" 2>/dev/null; printf '%s\t%s\n' "$1" "$2"; } > "${f}.tmp" && mv -f "${f}.tmp" "$f"
+}
+_pip_src_note() {     # $1=地址；若是合成地址则输出 "  (NAT64，原 xxx)"
+    local f s; f=$(_pip_nf)
+    [ -f "$f" ] || return 0
+    s=$(awk -F'\t' -v a="$1" '$1==a{print $2; exit}' "$f")
+    [ -n "$s" ] && echo "  (NAT64，原 ${s})"
+    return 0
+}
+
+# 检测 ProxyIP 是否可用(端口缺省443)；读取 pip_addr/pip_port，设置 fam direct_info pip_info
+# 纯 IPv6 机器连不上只有 IPv4 的 ProxyIP 时，自动改用公共 NAT64 合成地址：此时 pip_addr 变为合成的 IPv6 地址，
+# 原地址记在 pip_nat64_src。返回 0=可用 1=该 ProxyIP 不可用 2=服务器自身访问不了 cloudflare.com
 _pip_probe() {
     [ -z "$pip_port" ] && pip_port=443
+    pip_nat64_src=""
     fam="-4"
     direct_info=$(_pip_trace "" "" "$fam")
     [ -z "$direct_info" ] && { fam="-6"; direct_info=$(_pip_trace "" "" "$fam"); }
@@ -117,6 +160,16 @@ _pip_probe() {
     echo ""
     green "服务器直连:   ${direct_info}"
     pip_info=$(_pip_trace "" "$pip_addr" "$fam" "$pip_port")
+    if [ -z "$pip_info" ] && [ "$fam" = "-6" ] && [[ "$pip_addr" != *:* ]]; then
+        yellow "本机是纯 IPv6 环境，该 ProxyIP 无法直接连接，正在尝试通过公共 NAT64 (nat64.net) 连接..."
+        local lit
+        lit=$(_pip_nat64_find "$pip_addr" "$pip_port" "$fam")
+        if [ -n "$lit" ]; then
+            pip_nat64_src=$pip_addr; pip_addr=$lit
+            pip_info=$(_pip_trace "" "$pip_addr" "$fam" "$pip_port")
+            green "已通过公共 NAT64 连通，改用合成地址: ${pip_addr}"
+        fi
+    fi
     [ -n "$pip_info" ] || return 1
     return 0
 }
@@ -316,7 +369,7 @@ _pip_hist_show() {
         addr_s="$a"; [[ "$a" == *:* ]] && addr_s="[${a}]"
         if [ "$f" -ge "$n" ] 2>/dev/null; then lat_s="全部超时(${f}/${n})"; else lat_s="平均${avg}ms 最高${mx}ms 超时${f}/${n}"; fi
         if [ -z "$dl" ] || [ "$dl" = "-" ]; then dl_s="下载 未测"; else dl_s="下载 ${dl}Mbps"; fi
-        echo -e " ${skyblue}${i}.${re} ${yellow}${addr_s}:${p}${re}  ${lat_s}  ${dl_s}  ${t}"
+        echo -e " ${skyblue}${i}.${re} ${yellow}${addr_s}:${p}${re}$(_pip_src_note "$a")  ${lat_s}  ${dl_s}  ${t}"
     done < "$(_pip_hf)"
 }
 
@@ -365,7 +418,7 @@ speedtest_proxyip_menu() {
     if [ ${#names[@]} -gt 0 ]; then
         green "当前配置:"
         for j in "${!names[@]}"; do
-            echo -e " ${green}$((j+1)). ${names[$j]}${re}  ${yellow}$(_pip_hostport "${addrs[$j]}" "${ports[$j]}")${re}$([ "${names[$j]}" = "$cur_label" ] && echo '  (当前使用)')"
+            echo -e " ${green}$((j+1)). ${names[$j]}${re}  ${yellow}$(_pip_hostport "${addrs[$j]}" "${ports[$j]}")${re}$(_pip_src_note "${addrs[$j]}")$([ "${names[$j]}" = "$cur_label" ] && echo '  (当前使用)')"
         done
     else
         yellow "还没有配置 ProxyIP"
@@ -417,11 +470,20 @@ speedtest_proxyip_menu() {
     reading "是否同时测下载速度？(每个约15秒) (y/N): " sp_dl
     fam=$(_pip_fam)
     echo ""
-    local dl_rec key hp sum_lines=()
+    local dl_rec key hp nlit sum_lines=()
     for j in "${!tn[@]}"; do
         hp=$(_pip_hostport "${ta[$j]}" "${tp[$j]}")
         echo -e "${green}${tn[$j]}${re}  ${yellow}${hp}${re}"
         _pip_latency "${ta[$j]}" "${tp[$j]}" "$fam" 8
+        if [ "$pip_lat_fail" -ge "$pip_lat_n" ] && [ "$fam" = "-6" ] && [[ "${ta[$j]}" != *:* ]]; then
+            nlit=$(_pip_nat64_find "${ta[$j]}" "${tp[$j]}" "$fam")
+            if [ -n "$nlit" ]; then
+                yellow "  纯 IPv6 环境，已改用公共 NAT64 合成地址测试: ${nlit}"
+                _pip_nat64_save "$nlit" "${ta[$j]}"
+                ta[$j]=$nlit; hp=$(_pip_hostport "${ta[$j]}" "${tp[$j]}")
+                _pip_latency "${ta[$j]}" "${tp[$j]}" "$fam" 8
+            fi
+        fi
         _pip_show_latency
         dl_rec=""
         if [[ "$sp_dl" == "y" || "$sp_dl" == "Y" ]]; then
@@ -463,7 +525,7 @@ proxyip_menu() {
         pa=$(_pip_conf_get P_ADDR); pp=$(_pip_conf_get P_PORT)
         nb=$(_pip_bk_count)
         echo ""
-        echo -e " 主 ProxyIP: ${yellow}${pa}:${pp:-443}${re}   当前使用: $(_pip_cur_label)"
+        echo -e " 主 ProxyIP: ${yellow}$(_pip_hostport "$pa" "${pp:-443}")${re}$(_pip_src_note "$pa")   当前使用: $(_pip_cur_label)"
         if [ "$nb" -gt 0 ]; then
             echo -e " 备用 ProxyIP: ${nb} 个   自动切换: $(_pip_watch_state)"
         else
@@ -561,9 +623,9 @@ change_proxyip_route() {
     fi
     _pip_probe
     case $? in
-        0) green "经 ProxyIP:   ${pip_addr}:${pip_port}  ${pip_info}" ;;
+        0) green "经 ProxyIP:   $(_pip_hostport "$pip_addr" "$pip_port")  ${pip_info}" ;;
         2) sleep 2; proxyip_menu; return ;;
-        *) red "该 ProxyIP (${pip_addr}:${pip_port}) 不可用，已取消"; sleep 3; proxyip_menu; return ;;
+        *) red "该 ProxyIP ($(_pip_hostport "$pip_addr" "$pip_port")) 不可用，已取消"; sleep 3; proxyip_menu; return ;;
     esac
     _pip_quality_gate "$pip_addr" "$pip_port" "$fam" || { proxyip_menu; return; }
 
@@ -571,7 +633,8 @@ change_proxyip_route() {
     _pip_conf_set P_ADDR "$pip_addr"; _pip_conf_set P_PORT "$pip_port"
     _pip_conf_set CUR_ADDR "$pip_addr"; _pip_conf_set CUR_PORT "$pip_port"
     _pip_conf_set FAILS 0; _pip_conf_set OKS 0
-    green "\n已将所有 ProxyIP 分流改为 ${pip_addr}:${pip_port}"
+    [ -n "$pip_nat64_src" ] && _pip_nat64_save "$pip_addr" "$pip_nat64_src"
+    green "\n已将所有 ProxyIP 分流改为 $(_pip_hostport "$pip_addr" "$pip_port")"
     sleep 2; proxyip_menu
 }
 
@@ -590,11 +653,11 @@ backup_proxyip_menu() {
         n=$((n+1)); bka+=("$a"); bkp+=("${p:-443}")
     done < <(_pip_bk_list)
     local cur_label; cur_label=$(_pip_cur_label)
-    echo -e " 主 ProxyIP:   ${yellow}${pa}:${pp:-443}${re}"
+    echo -e " 主 ProxyIP:   ${yellow}$(_pip_hostport "$pa" "${pp:-443}")${re}$(_pip_src_note "$pa")"
     if [ "$n" -eq 0 ]; then
         echo " 备用 ProxyIP: 未设置"
     else
-        for i in "${!bka[@]}"; do echo -e " 备用 $((i+1)):     ${yellow}${bka[$i]}:${bkp[$i]}${re}"; done
+        for i in "${!bka[@]}"; do echo -e " 备用 $((i+1)):     ${yellow}$(_pip_hostport "${bka[$i]}" "${bkp[$i]}")${re}$(_pip_src_note "${bka[$i]}")"; done
     fi
     echo -e " 当前使用:     ${cur_label}"
     echo -e " 自动切换:     $(_pip_watch_state)"
@@ -629,9 +692,9 @@ backup_proxyip_menu() {
             done
             _pip_probe
             case $? in
-                0) green "经 ProxyIP:   ${pip_addr}:${pip_port}  ${pip_info}" ;;
+                0) green "经 ProxyIP:   $(_pip_hostport "$pip_addr" "$pip_port")  ${pip_info}" ;;
                 2) sleep 2; backup_proxyip_menu; return ;;
-                *) red "该 ProxyIP (${pip_addr}:${pip_port}) 不可用，已取消"; sleep 3; backup_proxyip_menu; return ;;
+                *) red "该 ProxyIP ($(_pip_hostport "$pip_addr" "$pip_port")) 不可用，已取消"; sleep 3; backup_proxyip_menu; return ;;
             esac
             # 防呆：出口 IP 和主 / 其他备用相同就是同一个源，主挂了它也会一起挂，不能当备用
             local new_ip o_ip dup=""
@@ -650,7 +713,8 @@ backup_proxyip_menu() {
             fi
             _pip_quality_gate "$pip_addr" "$pip_port" "$fam" || { backup_proxyip_menu; return; }
             echo "${pip_addr} ${pip_port}" >> "$(_pip_bkf)"
-            green "\n已添加备用 ProxyIP: ${pip_addr}:${pip_port} (备用$((n+1)))"
+            [ -n "$pip_nat64_src" ] && _pip_nat64_save "$pip_addr" "$pip_nat64_src"
+            green "\n已添加备用 ProxyIP: $(_pip_hostport "$pip_addr" "$pip_port") (备用$((n+1)))"
             if [ "$(_pip_watch_state)" != "运行中" ]; then
                 reading "是否开启自动切换？(Y/n): " bk_auto
                 if [[ "$bk_auto" != "n" && "$bk_auto" != "N" ]]; then
@@ -697,7 +761,7 @@ backup_proxyip_menu() {
             echo ""
             for j in "${!all_a[@]}"; do
                 nm="主"; [ "$j" -gt 0 ] && nm="备用${j}"
-                echo -e " $((j+1)). ${nm}  ${all_a[$j]}:${all_p[$j]}$([ "$nm" = "$cur_label" ] && echo '  (当前)')"
+                echo -e " $((j+1)). ${nm}  $(_pip_hostport "${all_a[$j]}" "${all_p[$j]}")$(_pip_src_note "${all_a[$j]}")$([ "$nm" = "$cur_label" ] && echo '  (当前)')"
             done
             reading "输入要切换到的序号 (回车返回): " bk_sw
             [ -z "$bk_sw" ] && { backup_proxyip_menu; return; }
@@ -758,7 +822,7 @@ add_proxyip_route() {
         reuse=1
         pip_addr=$(_pip_conf_get CUR_ADDR); pip_port=$(_pip_conf_get CUR_PORT)
         [ -z "$pip_addr" ] && { pip_addr=$(_pip_conf_get P_ADDR); pip_port=$(_pip_conf_get P_PORT); }
-        yellow "已有 ProxyIP 分流，新规则沿用当前 ProxyIP: ${pip_addr}:${pip_port:-443}"
+        yellow "已有 ProxyIP 分流，新规则沿用当前 ProxyIP: $(_pip_hostport "$pip_addr" "${pip_port:-443}")"
     else
         _pip_read_addr "请输入 ProxyIP，可带端口，如 tw.william.us.ci 或 tw.william.us.ci:8443 (不写端口默认443，回车返回): " pip_in
         [ -z "$pip_in" ] && { warp_manage; return; }
@@ -771,9 +835,9 @@ add_proxyip_route() {
     case $? in
         0) ;;
         2) sleep 2; warp_manage; return ;;
-        *) red "该 ProxyIP (${pip_addr}:${pip_port}) 不可用，已取消 (若它用的不是443端口，请写成 域名:端口)"; sleep 3; warp_manage; return ;;
+        *) red "该 ProxyIP ($(_pip_hostport "$pip_addr" "$pip_port")) 不可用，已取消 (若它用的不是443端口，请写成 域名:端口)"; sleep 3; warp_manage; return ;;
     esac
-    green "经 ProxyIP:   ${pip_addr}:${pip_port}  ${pip_info}"
+    green "经 ProxyIP:   $(_pip_hostport "$pip_addr" "$pip_port")  ${pip_info}"
     local d_ip p_ip
     d_ip=$(echo "$direct_info" | sed -n 's/.*ip=\([^ ]*\).*/\1/p')
     p_ip=$(echo "$pip_info" | sed -n 's/.*ip=\([^ ]*\).*/\1/p')
@@ -868,8 +932,9 @@ add_proxyip_route() {
         _pip_conf_set P_ADDR "$pip_addr"; _pip_conf_set P_PORT "$pip_port"
         _pip_conf_set CUR_ADDR "$pip_addr"; _pip_conf_set CUR_PORT "$pip_port"
         _pip_conf_set FAILS 0; _pip_conf_set OKS 0
+        [ -n "$pip_nat64_src" ] && _pip_nat64_save "$pip_addr" "$pip_nat64_src"
     fi
-    green "\n已添加 ProxyIP 分流 '${tag}' -> ${pip_addr}:${pip_port}，域名: ${ok_domains[*]}"
+    green "\n已添加 ProxyIP 分流 '${tag}' -> $(_pip_hostport "$pip_addr" "$pip_port")，域名: ${ok_domains[*]}"
     yellow "提示：已同时拦截这些域名的 UDP/443(QUIC)，让浏览器回退到 TCP，否则 QUIC 会绕过 ProxyIP。"
     yellow "验证：客户端连上节点后访问 https://chatgpt.com/cdn-cgi/trace 之类 (对应站点的 /cdn-cgi/trace)，查看 ip= 是否为 ProxyIP 的出口。"
     sleep 3; proxyip_menu
@@ -1239,7 +1304,7 @@ uninstall_plugin() {
 
     # 4) 删除插件文件
     rm -f "${plugin_dir}/proxyip.sh" "${plugin_dir}/proxyip-inject.sh" "${plugin_dir}/proxyip-watch.sh" "${plugin_dir}/proxyip-watch.sh.tmp" \
-          "${plugin_dir}/proxyip.conf" "${plugin_dir}/proxyip.backups" "${plugin_dir}/proxyip.history" "${plugin_dir}/proxyip-watch.log" \
+          "${plugin_dir}/proxyip.conf" "${plugin_dir}/proxyip.backups" "${plugin_dir}/proxyip.history" "${plugin_dir}/proxyip.nat64" "${plugin_dir}/proxyip.nat64.tmp" "${plugin_dir}/proxyip-watch.log" \
           "${plugin_dir}/proxyip-watch.log.tmp" "${plugin_dir}/main_url" "${plugin_dir}/sb_link_created"
     rmdir "$plugin_dir" 2>/dev/null
 
