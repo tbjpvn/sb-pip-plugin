@@ -1,6 +1,15 @@
 #!/bin/bash
 # =========================================================
-# sb-pip-plugin
+# sing-box.sh 插件：公共 ProxyIP 分流（单文件，用链接安装）
+#
+# 安装/更新: bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh)
+# 卸载:      bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh) -u
+#
+# 原理：sb 快捷指令每次都会从 GitHub 拉取最新主脚本运行，本机没有主脚本文件可改。
+#       安装时把 /etc/sing-box/sb.sh 换成带插件的版本：拉取主脚本 -> 自动在
+#       「WARP分流管理」菜单末尾追加本插件入口(序号=现有最大序号+1) -> 再运行。
+#       主脚本本身不被修改；插入失败时自动回退为原样运行。
+# 注意：只对 sb 命令生效；直接用链接运行主脚本时没有此菜单。
 # =========================================================
 export LANG=en_US.UTF-8
 work_dir="${SB_WORK_DIR:-/etc/sing-box}"
@@ -811,7 +820,7 @@ add_proxyip_route() {
     sb_ver=$("${work_dir}/sing-box" version 2>/dev/null | awk 'NR==1{print $3}')
     if [ -n "$sb_ver" ] && [ "$(printf '%s\n1.11.0\n' "$sb_ver" | sort -V | head -n1)" != "1.11.0" ]; then
         red "当前 sing-box 内核版本 ${sb_ver} 过低，ProxyIP 分流需要 1.11.0 及以上，请先在主菜单更新内核。"
-        sleep 3; warp_manage; return
+        sleep 3; proxyip_menu; return
     fi
 
     _pip_sync_conf
@@ -825,17 +834,17 @@ add_proxyip_route() {
         yellow "已有 ProxyIP 分流，新规则沿用当前 ProxyIP: $(_pip_hostport "$pip_addr" "${pip_port:-443}")"
     else
         _pip_read_addr "请输入 ProxyIP，可带端口，如 tw.william.us.ci 或 tw.william.us.ci:8443 (不写端口默认443，回车返回): " pip_in
-        [ -z "$pip_in" ] && { warp_manage; return; }
+        [ -z "$pip_in" ] && { proxyip_menu; return; }
         pip_in=$(echo "$pip_in" | xargs)
         if ! _pip_parse_addr "$pip_in"; then
-            red "地址或端口格式无效"; sleep 2; warp_manage; return
+            red "地址或端口格式无效"; sleep 2; proxyip_menu; return
         fi
     fi
     _pip_probe
     case $? in
         0) ;;
-        2) sleep 2; warp_manage; return ;;
-        *) red "该 ProxyIP ($(_pip_hostport "$pip_addr" "$pip_port")) 不可用，已取消 (若它用的不是443端口，请写成 域名:端口)"; sleep 3; warp_manage; return ;;
+        2) sleep 2; proxyip_menu; return ;;
+        *) red "该 ProxyIP ($(_pip_hostport "$pip_addr" "$pip_port")) 不可用，已取消 (若它用的不是443端口，请写成 域名:端口)"; sleep 3; proxyip_menu; return ;;
     esac
     green "经 ProxyIP:   $(_pip_hostport "$pip_addr" "$pip_port")  ${pip_info}"
     local d_ip p_ip
@@ -844,11 +853,11 @@ add_proxyip_route() {
     if [ "$d_ip" = "$p_ip" ]; then
         yellow "\n两者出口IP相同：该 ProxyIP 没有改变出口，分流没有意义。"
         reading "仍要继续？(y/N): " go_on
-        [[ "$go_on" == "y" || "$go_on" == "Y" ]] || { warp_manage; return; }
+        [[ "$go_on" == "y" || "$go_on" == "Y" ]] || { proxyip_menu; return; }
     fi
 
     if [ "$reuse" -eq 0 ]; then
-        _pip_quality_gate "$pip_addr" "$pip_port" "$fam" || { warp_manage; return; }
+        _pip_quality_gate "$pip_addr" "$pip_port" "$fam" || { proxyip_menu; return; }
     fi
 
     echo ""
@@ -865,7 +874,7 @@ add_proxyip_route() {
         3)
             reading "规则名称(字母/数字/下划线/中横线): " pip_name
             pip_name=$(echo "$pip_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/_/g')
-            [ -z "$pip_name" ] && { red "名称不能为空"; sleep 1; warp_manage; return; }
+            [ -z "$pip_name" ] && { red "名称不能为空"; sleep 1; proxyip_menu; return; }
             reading "域名列表(空格或逗号分隔，含下级域名): " pip_dom_in
             pip_dom_in="${pip_dom_in//,/ }"
             local d
@@ -873,17 +882,17 @@ add_proxyip_route() {
                 [[ "$d" =~ $pip_re_dom ]] && pip_domains+=("$d") || yellow "跳过无效域名: $d"
             done
             ;;
-        *) warp_manage; return ;;
+        *) proxyip_menu; return ;;
     esac
-    [ ${#pip_domains[@]} -eq 0 ] && { red "没有有效域名"; sleep 1; warp_manage; return; }
+    [ ${#pip_domains[@]} -eq 0 ] && { red "没有有效域名"; sleep 1; proxyip_menu; return; }
 
     local tag="pip-${pip_name}"
     if jq -e --arg t "$tag" '.route.rule_set[]? | select(.tag == $t)' "$route_file" >/dev/null 2>&1; then
-        yellow "规则 '${tag}' 已存在，请先在「2. 删除分流服务」中删除后再添加"
-        sleep 2; warp_manage; return
+        yellow "规则 '${tag}' 已存在，请先在本菜单「2. 删除 ProxyIP 分流」中删除后再添加"
+        sleep 2; proxyip_menu; return
     fi
     if jq -e --arg t "$pip_name" '.route.rules[]? | select(.rule_set != null) | .rule_set[]? | select(. == $t)' "$route_file" >/dev/null 2>&1; then
-        yellow "注意：同名的 '${pip_name}' 分流规则已在使用其他出站，先匹配的规则优先，建议先在「2. 删除分流服务」中删除它，否则 ProxyIP 可能不生效。"
+        yellow "注意：同名的 '${pip_name}' 分流规则已在使用其他出站，先匹配的规则优先，建议先在 WARP分流管理 的「2. 删除分流服务」中删除它，否则 ProxyIP 可能不生效。"
     fi
 
     # 逐个域名检测：必须能经 ProxyIP 返回 CF trace，否则跳过，避免整个域名打不开
@@ -898,7 +907,7 @@ add_proxyip_route() {
             yellow "  ✘ ${d}  (非CF托管或不可达，已跳过)"
         fi
     done
-    [ ${#ok_domains[@]} -eq 0 ] && { red "没有可用域名，已取消"; sleep 3; warp_manage; return; }
+    [ ${#ok_domains[@]} -eq 0 ] && { red "没有可用域名，已取消"; sleep 3; proxyip_menu; return; }
 
     local domains_json="[" dd
     for dd in "${ok_domains[@]}"; do domains_json+="\"${dd}\","; done
@@ -922,7 +931,7 @@ add_proxyip_route() {
         cp -f "${route_file}.bak" "$route_file"
         red "\n配置校验未通过，已自动回滚：\n"
         echo "$check_output"
-        sleep 3; warp_manage; return
+        sleep 3; proxyip_menu; return
     fi
     rm -f "${route_file}.bak"
 
