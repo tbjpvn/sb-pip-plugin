@@ -6,7 +6,7 @@ export LANG=en_US.UTF-8
 work_dir="${SB_WORK_DIR:-/etc/sing-box}"
 plugin_dir="${work_dir}/plugins"
 wrapper="${work_dir}/sb.sh"
-wrapper_marker="# proxyip-plugin wrapper"
+wrapper_marker="plugin wrapper"   # 子串匹配: 兼容旧标记 "# proxyip-plugin wrapper" 与多插件共用的 "# sb-plugin wrapper"
 red()    { echo -e "\e[1;91m$1\033[0m"; }
 green()  { echo -e "\e[1;32m$1\033[0m"; }
 yellow() { echo -e "\e[1;33m$1\033[0m"; }
@@ -1163,11 +1163,15 @@ PIP_WATCH_EOF
 }
 
 write_wrapper() {
-    local url=$1
+    local url=$1 stages="" f
+    # 与其它插件(如 quota)共用: 按文件名顺序串联 plugins/*-inject.sh，谁先装都一样
+    for f in "${plugin_dir}"/*-inject.sh; do
+        [ -f "$f" ] && stages="${stages} | bash ${f}"
+    done
     cat > "$wrapper" <<EOF
 #!/usr/bin/env bash
-${wrapper_marker}
-bash <(curl -Ls ${url} | bash ${plugin_dir}/proxyip-inject.sh) "\$@"
+# sb-plugin wrapper
+bash <(curl -Ls ${url}${stages}) "\$@"
 EOF
     chmod +x "$wrapper"
 }
@@ -1189,6 +1193,7 @@ install_plugin() {
     local url
     if grep -q "$wrapper_marker" "$wrapper"; then
         url=$(cat "${plugin_dir}/main_url" 2>/dev/null)
+        [ -z "$url" ] && url=$(grep -oE 'https://[^ )"]+' "$wrapper" | head -1)
     else
         cp -f "$wrapper" "${wrapper}.orig"
         url=$(grep -oE 'https://[^ )"]+' "$wrapper" | head -1)
@@ -1263,7 +1268,7 @@ remove_pip_rules() {
 }
 
 uninstall_plugin() {
-    local url
+    local url others=0
     url=$(cat "${plugin_dir}/main_url" 2>/dev/null)
 
     # 1) 停止并删除自动切换服务
@@ -1286,7 +1291,11 @@ uninstall_plugin() {
 
     # 3) 还原 sb 快捷指令 (只处理带本插件标记的 sb.sh；主脚本重装后重建的 sb.sh 不动)
     if [ -f "$wrapper" ] && grep -q "$wrapper_marker" "$wrapper"; then
-        if [ -f "${wrapper}.orig" ]; then
+        rm -f "${plugin_dir}/proxyip-inject.sh"
+        if ls "${plugin_dir}"/*-inject.sh >/dev/null 2>&1; then
+            others=1      # 还有其它插件(如 quota)在用 sb.sh: 只摘掉本插件, 保留它们的注入器
+            write_wrapper "$url"
+        elif [ -f "${wrapper}.orig" ]; then
             mv -f "${wrapper}.orig" "$wrapper"
         elif [ -n "$url" ]; then
             printf '#!/usr/bin/env bash\nbash <(curl -Ls %s) $1\n' "$url" > "$wrapper"
@@ -1298,19 +1307,21 @@ uninstall_plugin() {
         rm -f "${wrapper}.orig"
     fi
     # 本插件创建过 /usr/bin/sb 链接才删除；原来就有的不动
-    if [ -z "$SB_WORK_DIR" ] && [ -f "${plugin_dir}/sb_link_created" ] && [ -L /usr/bin/sb ]; then
+    if [ "$others" = 0 ] && [ -z "$SB_WORK_DIR" ] && [ -f "${plugin_dir}/sb_link_created" ] && [ -L /usr/bin/sb ]; then
         rm -f /usr/bin/sb
     fi
 
     # 4) 删除插件文件
     rm -f "${plugin_dir}/proxyip.sh" "${plugin_dir}/proxyip-inject.sh" "${plugin_dir}/proxyip-watch.sh" "${plugin_dir}/proxyip-watch.sh.tmp" \
           "${plugin_dir}/proxyip.conf" "${plugin_dir}/proxyip.backups" "${plugin_dir}/proxyip.history" "${plugin_dir}/proxyip.nat64" "${plugin_dir}/proxyip.nat64.tmp" "${plugin_dir}/proxyip-watch.log" \
-          "${plugin_dir}/proxyip-watch.log.tmp" "${plugin_dir}/main_url" "${plugin_dir}/sb_link_created"
+          "${plugin_dir}/proxyip-watch.log.tmp"
+    # main_url / sb 链接标记为各插件共用, 其它插件还在就保留
+    [ "$others" = 0 ] && rm -f "${plugin_dir}/main_url" "${plugin_dir}/sb_link_created"
     rmdir "$plugin_dir" 2>/dev/null
 
     # 5) 残留检查
     local left=""
-    [ -f "${wrapper}.orig" ] && left+=" ${wrapper}.orig"
+    [ "$others" = 0 ] && [ -f "${wrapper}.orig" ] && left+=" ${wrapper}.orig"
     [ -d "$plugin_dir" ] && ls "$plugin_dir" 2>/dev/null | grep -q 'proxyip' && left+=" ${plugin_dir}/proxyip*"
     [ -z "$SB_WORK_DIR" ] && { [ -f /etc/systemd/system/sb-proxyip.service ] || [ -f /etc/init.d/sb-proxyip ]; } && left+=" sb-proxyip 服务文件"
     [ -f "${work_dir}/conf/route.json" ] && grep -q '"pip-' "${work_dir}/conf/route.json" 2>/dev/null && left+=" route.json 中的 pip- 规则"
