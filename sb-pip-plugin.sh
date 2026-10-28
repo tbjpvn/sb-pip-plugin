@@ -630,17 +630,17 @@ proxyip_menu() {
     else
         local t a d
         while IFS=$'\t' read -r t a d; do
-            echo -e " - ${green}${t}${re} ${purple}->${re} ${yellow}${a}${re}  ${d}"
+            echo -e " - ${skyblue}${t}${re} ${purple}->${re} ${yellow}${a}${re}  ${green}${d}${re}"
         done <<< "$rows"
     fi
     local ns pf
     ns=$(_pip_slot_count); pf=$(_pip_pref)
     if [ "$ns" -gt 0 ]; then
         echo ""
-        green " ProxyIP 槽位: ${ns}/5 已设置"
-        green " 首选: $([ -n "$pf" ] && echo "ProxyIP ${pf}" || echo 未设置)"
-        green " 当前使用: $(_pip_cur_label)"
-        green " 自动切换: $(_pip_watch_state)"
+        yellow " ProxyIP 槽位: ${ns}/5 已设置"
+        yellow " 首选: $([ -n "$pf" ] && echo "ProxyIP ${pf}" || echo 未设置)"
+        yellow " 当前使用: $(_pip_cur_label)"
+        yellow " 自动切换: $(_pip_watch_state)"
     fi
     echo ""
     green  "1. 添加 ProxyIP 分流"
