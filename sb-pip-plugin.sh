@@ -721,10 +721,14 @@ proxyip_slot_menu() {
     _pip_sync_conf
     local n a p pf cs ns
     pf=$(_pip_pref); cs=$(_pip_cur_slot); ns=$(_pip_slot_count)
+    local tg=""
+    [ -n "$pf" ] && tg+="  ${yellow}★首选${re} ${green}${pf}${re}"
+    [ -n "$cs" ] && tg+="  ${yellow}▶当前使用${re} ${green}${cs}${re}"
+    [ -n "$tg" ] && echo -e "${tg}"
     for n in 1 2 3 4 5; do
         read -r a p <<< "$(_pip_slot_get "$n")"
         if [ -n "$a" ]; then
-            echo -e " ${green}ProxyIP ${n}:${re} ${yellow}$(_pip_hostport "$a" "$p")${re}$(_pip_src_note "$a")$(_pip_slot_tags "$n")"
+            echo -e " ${green}ProxyIP ${n}:${re} ${yellow}$(_pip_hostport "$a" "$p")${re}$(_pip_src_note "$a")  ${skyblue}$(_pip_hist_fmt "$(_pip_hist_find "$a" "$p")")${re}"
         else
             echo -e " ${green}ProxyIP ${n}:${re} ${yellow}(空)${re}"
         fi
