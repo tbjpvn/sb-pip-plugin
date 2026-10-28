@@ -1,6 +1,15 @@
 #!/bin/bash
 # =========================================================
-# sb-pip-plugin
+# sing-box.sh 插件：公共 ProxyIP 分流（单文件，用链接安装）
+#
+# 安装/更新: bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh)
+# 卸载:      bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh) -u
+#
+# 原理：sb 快捷指令每次都会从 GitHub 拉取最新主脚本运行，本机没有主脚本文件可改。
+#       安装时把 /etc/sing-box/sb.sh 换成带插件的版本：拉取主脚本 -> 自动在
+#       「WARP分流管理」菜单末尾追加本插件入口(序号=现有最大序号+1) -> 再运行。
+#       主脚本本身不被修改；插入失败时自动回退为原样运行。
+# 注意：只对 sb 命令生效；直接用链接运行主脚本时没有此菜单。
 # =========================================================
 export LANG=en_US.UTF-8
 work_dir="${SB_WORK_DIR:-/etc/sing-box}"
@@ -621,20 +630,22 @@ proxyip_menu() {
     else
         local t a d
         while IFS=$'\t' read -r t a d; do
-            echo -e " - ${skyblue}${t}${re} ${purple}->${re} ${yellow}${a}${re}  ${d}"
+            echo -e " - ${green}${t}${re} ${purple}->${re} ${yellow}${a}${re}  ${d}"
         done <<< "$rows"
     fi
     local ns pf
     ns=$(_pip_slot_count); pf=$(_pip_pref)
     if [ "$ns" -gt 0 ]; then
         echo ""
-        echo -e " ProxyIP 槽位: ${ns}/5 已设置   当前使用: $(_pip_cur_label)   首选: $([ -n "$pf" ] && echo "ProxyIP ${pf}" || echo 未设置)"
-        echo -e " 自动切换: $(_pip_watch_state)"
+        green " ProxyIP 槽位: ${ns}/5 已设置"
+        green " 首选: $([ -n "$pf" ] && echo "ProxyIP ${pf}" || echo 未设置)"
+        green " 当前使用: $(_pip_cur_label)"
+        green " 自动切换: $(_pip_watch_state)"
     fi
     echo ""
     green  "1. 添加 ProxyIP 分流"
     red    "2. 删除 ProxyIP 分流"
-    skyblue "3. ProxyIP 槽位 / 首选 / 自动切换"
+    green  "3. ProxyIP 槽位 / 首选 / 自动切换"
     green  "4. 测速 (延迟 / 下载速度)"
     purple "0. 返回上级菜单"
     reading "请输入选择: " pip_menu_choice
