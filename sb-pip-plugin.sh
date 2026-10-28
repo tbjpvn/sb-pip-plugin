@@ -1,6 +1,15 @@
 #!/bin/bash
 # =========================================================
-# sb-pip-plugin.sh
+# sing-box.sh 插件：公共 ProxyIP 分流（单文件，用链接安装）
+#
+# 安装/更新: bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh)
+# 卸载:      bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh) -u
+#
+# 原理：sb 快捷指令每次都会从 GitHub 拉取最新主脚本运行，本机没有主脚本文件可改。
+#       安装时把 /etc/sing-box/sb.sh 换成带插件的版本：拉取主脚本 -> 自动在
+#       「WARP分流管理」菜单末尾追加本插件入口(序号=现有最大序号+1) -> 再运行。
+#       主脚本本身不被修改；插入失败时自动回退为原样运行。
+# 注意：只对 sb 命令生效；直接用链接运行主脚本时没有此菜单。
 # =========================================================
 export LANG=en_US.UTF-8
 work_dir="${SB_WORK_DIR:-/etc/sing-box}"
@@ -415,7 +424,7 @@ _pip_hist_add() {
     {
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "${7:--}" "$(date '+%m-%d %H:%M')"
         [ -f "$hf" ] && awk -F'\t' -v a="$1" -v p="$2" '!($1==a && $2==p)' "$hf"
-    } | head -n 5 > "${hf}.tmp" && mv -f "${hf}.tmp" "$hf"
+    } | head -n 10 > "${hf}.tmp" && mv -f "${hf}.tmp" "$hf"   # 存10条(5个槽位的数据不容易被挤掉)，列表只显示最近5条
 }
 
 _pip_hist_show() {
@@ -427,7 +436,52 @@ _pip_hist_show() {
         if [ "$f" -ge "$n" ] 2>/dev/null; then lat_s="全部超时(${f}/${n})"; else lat_s="平均${avg}ms 最高${mx}ms 超时${f}/${n}"; fi
         if [ -z "$dl" ] || [ "$dl" = "-" ]; then dl_s="下载 未测"; else dl_s="下载 ${dl}Mbps"; fi
         echo -e " ${skyblue}${i}.${re} ${yellow}${addr_s}:${p}${re}$(_pip_src_note "$a")  ${lat_s}  ${dl_s}  ${t}"
-    done < "$(_pip_hf)"
+    done < <(head -n 5 "$(_pip_hf)")
+}
+
+# 按 地址+端口 取最近一次测速记录(一行，tab分隔)；纯IPv6机器经 NAT64 测的，记录用的是合成地址，这里也一并找
+_pip_hist_find() {
+    local hf nf row s; hf=$(_pip_hf); nf=$(_pip_nf)
+    [ -f "$hf" ] || return 0
+    row=$(awk -F'\t' -v a="$1" -v p="$2" '$1==a && $2==p {print; exit}' "$hf")
+    if [ -z "$row" ] && [ -f "$nf" ]; then
+        while read -r s; do
+            [ -z "$s" ] && continue
+            row=$(awk -F'\t' -v a="$s" -v p="$2" '$1==a && $2==p {print; exit}' "$hf")
+            [ -n "$row" ] && break
+        done < <(awk -F'\t' -v a="$1" '$2==a {print $1}' "$nf")
+    fi
+    [ -n "$row" ] && printf '%s' "$row"
+    return 0
+}
+
+# 把一条测速记录格式化成显示文本；$1=记录行(没有则显示"未测速")
+_pip_hist_fmt() {
+    local a p avg mx f n dl t lat_s dl_s
+    [ -z "$1" ] && { printf '未测速'; return 0; }
+    IFS=$'\t' read -r a p avg mx f n dl t <<< "$1"
+    if [ "$f" -ge "$n" ] 2>/dev/null; then lat_s="全部超时(${f}/${n})"; else lat_s="平均${avg}ms 最高${mx}ms 超时${f}/${n}"; fi
+    if [ -z "$dl" ] || [ "$dl" = "-" ]; then dl_s="下载 未测"; else dl_s="下载 ${dl}Mbps"; fi
+    printf '%s  %s  %s' "$lat_s" "$dl_s" "$t"
+}
+
+# 显示当前配置(槽位)：标题后面跟 ★首选 N ▶当前使用 N，每个槽位后面跟最近一次测速数据
+# $1=1 时标题带"(输入槽位序号可单独测试)"；没有任何槽位返回 1
+_pip_cfg_show() {
+    local n a p pf cs tags="" cnt=0 title="当前配置"
+    pf=$(_pip_pref); cs=$(_pip_cur_slot)
+    [ -n "$pf" ] && tags+="  ★首选 ${pf}"
+    [ -n "$cs" ] && tags+="  ▶当前使用 ${cs}"
+    [ "$1" = 1 ] && title+=" (输入槽位序号可单独测试)"
+    for n in 1 2 3 4 5; do
+        read -r a p <<< "$(_pip_slot_get "$n")"
+        [ -z "$a" ] && continue
+        if [ "$cnt" -eq 0 ]; then echo -e "${green}${title}:${re}${tags}"; fi
+        cnt=$((cnt+1))
+        echo -e " ${green}${n}.${re} ${yellow}$(_pip_hostport "$a" "$p")${re}$(_pip_src_note "$a")  $(_pip_hist_fmt "$(_pip_hist_find "$a" "$p")")"
+    done
+    [ "$cnt" -eq 0 ] && { yellow "还没有配置 ProxyIP"; return 1; }
+    return 0
 }
 
 # $1=序号(1-5) -> 输出 "地址:端口"(IPv6 带方括号)，没有则无输出
@@ -470,36 +524,44 @@ speedtest_proxyip_menu() {
         [ -z "$a" ] && continue
         names+=("ProxyIP ${n}"); addrs+=("$a"); ports+=("${p:-443}"); nums+=("$n")
     done
-    if [ ${#names[@]} -gt 0 ]; then
-        green "当前配置 (输入槽位序号可单独测试):"
-        for j in "${!names[@]}"; do
-            echo -e " ${green}${nums[$j]}.${re} ${yellow}$(_pip_hostport "${addrs[$j]}" "${ports[$j]}")${re}$(_pip_src_note "${addrs[$j]}")$(_pip_slot_tags "${nums[$j]}")"
-        done
-    else
-        yellow "还没有配置 ProxyIP"
-    fi
+    _pip_cfg_show 0
     if [ -s "$(_pip_hf)" ]; then
         echo ""
         green "最近测速记录 (最多5条，仅供查看；设置 ProxyIP 槽位时输入对应序号可直接选用):"
         _pip_hist_show
     fi
     echo ""
-    echo -e " ${green}回车. 测试其他地址${re}"
-    echo -e " ${green}7. 批量测试其他地址 (域名/IP[:端口]，空格分隔，不写端口默认443)${re}"
-    echo -e " ${green}8. 测试全部配置${re}"
+    echo -e " ${green}1. 测试当前配置${re}"
+    echo -e " ${green}2. 批量测试其他地址 (域名/IP[:端口]，空格分隔，不写端口默认443，写一个就是单个测试)${re}"
     echo -e " ${green}x. 清空测速记录${re}"
     echo -e " ${purple}0. 返回上级菜单${re}"
-    reading "请输入序号 (回车=测试其他地址): " sp_choice
+    reading "请输入选择: " sp_choice
     local ta=() tp=() tn=() fam pip_addr pip_port rec tok k=0
     case "$sp_choice" in
         0) proxyip_menu; return ;;
-        "")
-            reading "请输入要测试的 ProxyIP，可带端口 (默认443，回车返回本页): " sp_in
-            [ -z "$sp_in" ] && { speedtest_proxyip_menu; return; }
-            sp_in=$(echo "$sp_in" | xargs)
-            if ! _pip_parse_addr "$sp_in"; then red "地址或端口格式无效"; sleep 2; speedtest_proxyip_menu; return; fi
-            tn=("待测"); ta=("$pip_addr"); tp=("${pip_port:-443}") ;;
-        7)
+        "") speedtest_proxyip_menu; return ;;
+        1)
+            [ ${#names[@]} -eq 0 ] && { yellow "还没有配置 ProxyIP"; sleep 2; speedtest_proxyip_menu; return; }
+            echo ""
+            _pip_cfg_show 1
+            echo -e " ${green}8. 测试全部配置${re}"
+            echo -e " ${purple}0. 返回${re}"
+            reading "请输入槽位序号 (回车返回): " sp_sub
+            case "$sp_sub" in
+                ""|0) speedtest_proxyip_menu; return ;;
+                8) tn=("${names[@]}"); ta=("${addrs[@]}"); tp=("${ports[@]}") ;;
+                *)
+                    if ! [[ "$sp_sub" =~ ^[1-5]$ ]]; then
+                        red "无效的选择"; sleep 1; speedtest_proxyip_menu; return
+                    fi
+                    local si=-1
+                    for j in "${!nums[@]}"; do [ "${nums[$j]}" = "$sp_sub" ] && si=$j; done
+                    if [ "$si" -lt 0 ]; then
+                        red "ProxyIP ${sp_sub} 还没有设置"; sleep 1; speedtest_proxyip_menu; return
+                    fi
+                    tn=("${names[$si]}"); ta=("${addrs[$si]}"); tp=("${ports[$si]}") ;;
+            esac ;;
+        2)
             reading "请输入多个地址，空格分隔，不写端口默认443 (如: a.com b.com:8443 1.2.3.4，回车返回本页): " sp_in
             [ -z "$sp_in" ] && { speedtest_proxyip_menu; return; }
             for tok in $sp_in; do
@@ -511,21 +573,10 @@ speedtest_proxyip_menu() {
                 fi
             done
             [ ${#ta[@]} -eq 0 ] && { red "没有有效地址"; sleep 2; speedtest_proxyip_menu; return; } ;;
-        8)
-            [ ${#names[@]} -eq 0 ] && { yellow "还没有配置 ProxyIP"; sleep 2; speedtest_proxyip_menu; return; }
-            tn=("${names[@]}"); ta=("${addrs[@]}"); tp=("${ports[@]}") ;;
         x|X)
             rm -f "$(_pip_hf)"; green "已清空测速记录"; sleep 1; speedtest_proxyip_menu; return ;;
         *)
-            if ! [[ "$sp_choice" =~ ^[1-5]$ ]]; then
-                red "无效的选择"; sleep 1; speedtest_proxyip_menu; return
-            fi
-            local si=-1
-            for j in "${!nums[@]}"; do [ "${nums[$j]}" = "$sp_choice" ] && si=$j; done
-            if [ "$si" -lt 0 ]; then
-                red "ProxyIP ${sp_choice} 还没有设置"; sleep 1; speedtest_proxyip_menu; return
-            fi
-            tn=("${names[$si]}"); ta=("${addrs[$si]}"); tp=("${ports[$si]}") ;;
+            red "无效的选择"; sleep 1; speedtest_proxyip_menu; return ;;
     esac
     reading "是否同时测下载速度？(每个约15秒) (y/N): " sp_dl
     fam=$(_pip_fam)
