@@ -1,6 +1,15 @@
 #!/bin/bash
 # =========================================================
-# sb-pip-plugin
+# sing-box.sh 插件：公共 ProxyIP 分流（单文件，用链接安装）
+#
+# 安装/更新: bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh)
+# 卸载:      bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh) -u
+#
+# 原理：sb 快捷指令每次都会从 GitHub 拉取最新主脚本运行，本机没有主脚本文件可改。
+#       安装时把 /etc/sing-box/sb.sh 换成带插件的版本：拉取主脚本 -> 自动在
+#       「WARP分流管理」菜单末尾追加本插件入口(序号=现有最大序号+1) -> 再运行。
+#       主脚本本身不被修改；插入失败时自动回退为原样运行。
+# 注意：只对 sb 命令生效；直接用链接运行主脚本时没有此菜单。
 # =========================================================
 export LANG=en_US.UTF-8
 work_dir="${SB_WORK_DIR:-/etc/sing-box}"
@@ -49,30 +58,57 @@ _pip_list_rules() {
     ' "$route_file" 2>/dev/null
 }
 
-# 旧版本添加过规则但还没有状态文件时，从 route.json 补全主 ProxyIP
+# 槽位 / 首选 / 当前使用 的状态：
+#   proxyip.slots 每行 "序号 地址 端口" (序号 1-5，空槽位不写)
+#   proxyip.conf  PREF=首选槽位序号(没有=不设首选) CUR_ADDR/CUR_PORT=当前正在使用的 ProxyIP
+# 旧版(主 + 备用列表)自动迁移：原来的主 -> 槽位1 并设为首选，备用依次放到 2-5
 _pip_sync_conf() {
-    # 旧版(单个备用)状态迁移到 备用列表 + CUR_ADDR/CUR_PORT
-    local ob_a ob_p
-    ob_a=$(_pip_conf_get B_ADDR)
-    if [ -n "$ob_a" ] && [ ! -f "$(_pip_bkf)" ]; then
-        ob_p=$(_pip_conf_get B_PORT); ob_p=${ob_p:-443}
-        echo "${ob_a} ${ob_p}" > "$(_pip_bkf)"
-        if [ "$(_pip_conf_get CURRENT)" = backup ]; then
-            _pip_conf_set CUR_ADDR "$ob_a"; _pip_conf_set CUR_PORT "$ob_p"
+    local sf la=() lp=() a p row has_pri=0 ob_a ob_p ca cp i k pf
+    sf=$(_pip_sf)
+    if [ ! -s "$sf" ]; then
+        a=$(_pip_conf_get P_ADDR); p=$(_pip_conf_get P_PORT)
+        if [ -z "$a" ] && [ -f "$route_file" ]; then
+            row=$(jq -r '.route.rules[]? | select(.override_address != null) | "\(.override_address)\t\(.override_port // 443)"' "$route_file" 2>/dev/null | head -1)
+            [ -n "$row" ] && { a=${row%%$'\t'*}; p=${row##*$'\t'}; }
         fi
+        if [ -n "$a" ]; then la+=("$a"); lp+=("${p:-443}"); has_pri=1; fi
+        ob_a=$(_pip_conf_get B_ADDR); ob_p=$(_pip_conf_get B_PORT)
+        if [ -f "$(_pip_bkf)" ]; then
+            while read -r a p; do
+                [ -n "$a" ] && { la+=("$a"); lp+=("${p:-443}"); }
+            done < "$(_pip_bkf)"
+        elif [ -n "$ob_a" ]; then
+            la+=("$ob_a"); lp+=("${ob_p:-443}")
+            if [ "$(_pip_conf_get CURRENT)" = backup ] && [ -z "$(_pip_conf_get CUR_ADDR)" ]; then
+                _pip_conf_set CUR_ADDR "$ob_a"; _pip_conf_set CUR_PORT "${ob_p:-443}"
+            fi
+        fi
+        if [ "${#la[@]}" -gt 0 ]; then
+            ca=$(_pip_conf_get CUR_ADDR); cp=$(_pip_conf_get CUR_PORT); cp=${cp:-443}
+            if [ "${#la[@]}" -gt 5 ]; then
+                # 超过 5 个：保留前 5 个；正在用的若排在后面，顶替第 5 个
+                for ((i=5; i<${#la[@]}; i++)); do
+                    if [ "${la[$i]}" = "$ca" ] && [ "${lp[$i]}" = "$cp" ]; then la[4]=${la[$i]}; lp[4]=${lp[$i]}; break; fi
+                done
+                la=("${la[@]:0:5}"); lp=("${lp[@]:0:5}")
+                yellow "ProxyIP 槽位最多 5 个，旧配置里超出的备用已忽略。"; sleep 3
+            fi
+            mkdir -p "$(dirname "$sf")"; : > "$sf"
+            for ((i=0; i<${#la[@]}; i++)); do echo "$((i+1)) ${la[$i]} ${lp[$i]}" >> "$sf"; done
+            [ "$has_pri" = 1 ] && _pip_conf_set PREF 1
+        fi
+        for k in P_ADDR P_PORT B_ADDR B_PORT CURRENT; do _pip_conf_del "$k"; done
+        rm -f "$(_pip_bkf)"
     fi
-    local k; for k in B_ADDR B_PORT CURRENT; do _pip_conf_del "$k"; done
-    # 旧版本添加过规则但还没有状态文件时，从 route.json 补全主 ProxyIP
-    if [ -z "$(_pip_conf_get P_ADDR)" ]; then
-        local row
+    # 首选必须指向已配置的槽位
+    pf=$(_pip_conf_get PREF)
+    if [ -n "$pf" ] && [ -z "$(_pip_slot_get "$pf")" ]; then _pip_conf_del PREF; fi
+    # 状态里没有当前使用的地址时，取路由规则里正在用的
+    if [ -z "$(_pip_conf_get CUR_ADDR)" ] && [ -f "$route_file" ]; then
         row=$(jq -r '.route.rules[]? | select(.override_address != null) | "\(.override_address)\t\(.override_port // 443)"' "$route_file" 2>/dev/null | head -1)
-        [ -z "$row" ] && return 0
-        _pip_conf_set P_ADDR "${row%%$'\t'*}"
-        _pip_conf_set P_PORT "${row##*$'\t'}"
-    fi
-    if [ -z "$(_pip_conf_get CUR_ADDR)" ]; then
-        _pip_conf_set CUR_ADDR "$(_pip_conf_get P_ADDR)"
-        _pip_conf_set CUR_PORT "$(_pip_conf_get P_PORT)"
+        if [ -n "$row" ]; then
+            _pip_conf_set CUR_ADDR "${row%%$'\t'*}"; _pip_conf_set CUR_PORT "${row##*$'\t'}"
+        fi
     fi
     return 0
 }
@@ -253,34 +289,64 @@ _pip_apply() {
     return 0
 }
 
-# 切换到 primary 或 backup
-_pip_switch_addr() {   # $1=地址 $2=端口：把规则切到该 ProxyIP 并记为当前使用
+# 把规则切到指定 ProxyIP 并记为当前使用
+_pip_switch_addr() {   # $1=地址 $2=端口
     _pip_apply "$1" "${2:-443}" || return 1
     _pip_conf_set CUR_ADDR "$1"; _pip_conf_set CUR_PORT "${2:-443}"
     _pip_conf_set FAILS 0; _pip_conf_set OKS 0
     return 0
 }
 
-# 备用 ProxyIP 列表：proxyip.backups，每行 "地址 端口"，顺序即优先级
-_pip_bkf() { echo "${work_dir}/plugins/proxyip.backups"; }
-_pip_bk_list() { sed '/^[[:space:]]*$/d' "$(_pip_bkf)" 2>/dev/null; }
-_pip_bk_count() { _pip_bk_list | wc -l; }
+# ---- 槽位 (ProxyIP 1-5) ----
+_pip_sf() { echo "${work_dir}/plugins/proxyip.slots"; }
+_pip_bkf() { echo "${work_dir}/plugins/proxyip.backups"; }   # 旧版备用列表，仅用于迁移
 
-# 当前是否在用主 ProxyIP
-_pip_on_primary() {
+# $1=序号 -> 输出 "地址 端口"，空槽位无输出
+_pip_slot_get() { awk -v n="$1" '$1==n && NF>=2 {print $2, ($3==""?443:$3); exit}' "$(_pip_sf)" 2>/dev/null; }
+_pip_slot_set() {   # $1=序号 $2=地址 $3=端口
+    local f; f=$(_pip_sf)
+    mkdir -p "$(dirname "$f")"
+    { awk -v n="$1" '$1!=n' "$f" 2>/dev/null; printf '%s %s %s\n' "$1" "$2" "${3:-443}"; } | sort -n > "${f}.tmp" && mv -f "${f}.tmp" "$f"
+}
+_pip_slot_clear() {   # $1=序号
+    local f; f=$(_pip_sf)
+    [ -f "$f" ] || return 0
+    awk -v n="$1" '$1!=n' "$f" > "${f}.tmp" && mv -f "${f}.tmp" "$f"
+    return 0
+}
+_pip_slot_count() { awk 'NF>=2' "$(_pip_sf)" 2>/dev/null | wc -l; }
+_pip_slot_first_empty() {
+    local n
+    for n in 1 2 3 4 5; do
+        [ -z "$(_pip_slot_get "$n")" ] && { echo "$n"; return 0; }
+    done
+    return 0
+}
+# 首选槽位序号(没设或指向空槽位则无输出)
+_pip_pref() {
+    local v; v=$(_pip_conf_get PREF)
+    [ -n "$v" ] && [ -n "$(_pip_slot_get "$v")" ] && echo "$v"
+    return 0
+}
+# 当前使用的槽位序号(当前地址不在任何槽位里则无输出)
+_pip_cur_slot() {
     local ca cp; ca=$(_pip_conf_get CUR_ADDR); cp=$(_pip_conf_get CUR_PORT)
     [ -z "$ca" ] && return 0
-    [ "$ca" = "$(_pip_conf_get P_ADDR)" ] && [ "${cp:-443}" = "$(_pip_conf_get P_PORT)" ]
+    awk -v a="$ca" -v p="${cp:-443}" '$2==a && ($3==""?443:$3)==p {print $1; exit}' "$(_pip_sf)" 2>/dev/null
+    return 0
 }
-# 当前使用的 ProxyIP 显示名：主 / 备用N
+# 当前使用的 ProxyIP 显示名：ProxyIP N
 _pip_cur_label() {
-    if _pip_on_primary; then echo 主; return; fi
-    local ca cp n=0 a p; ca=$(_pip_conf_get CUR_ADDR); cp=$(_pip_conf_get CUR_PORT)
-    while read -r a p; do
-        n=$((n+1))
-        if [ "$a" = "$ca" ] && [ "$p" = "${cp:-443}" ]; then echo "备用${n}"; return; fi
-    done < <(_pip_bk_list)
-    echo "${ca}:${cp}"
+    local s ca cp; s=$(_pip_cur_slot)
+    if [ -n "$s" ]; then echo "ProxyIP ${s}"; return; fi
+    ca=$(_pip_conf_get CUR_ADDR); cp=$(_pip_conf_get CUR_PORT)
+    if [ -n "$ca" ]; then _pip_hostport "$ca" "${cp:-443}"; else echo "未使用"; fi
+}
+# 槽位标记：★首选 ▶当前使用   $1=槽位序号
+_pip_slot_tags() {
+    [ "$1" = "$(_pip_pref)" ] && printf '  ★首选'
+    [ "$1" = "$(_pip_cur_slot)" ] && printf '  ▶当前使用'
+    return 0
 }
 # 自动切换的过慢阈值(毫秒)，默认3000
 _pip_slow_ms() { local v; v=$(_pip_conf_get SLOW_MS); echo "${v:-3000}"; }
@@ -407,25 +473,23 @@ speedtest_proxyip_menu() {
     clear
     green "=== ProxyIP 测速 ===\n"
     _pip_sync_conf
-    local names=() addrs=() ports=() a p j i=0 pa pp cur_label
-    pa=$(_pip_conf_get P_ADDR); pp=$(_pip_conf_get P_PORT)
-    cur_label=$(_pip_cur_label)
-    if [ -n "$pa" ]; then names+=("主"); addrs+=("$pa"); ports+=("${pp:-443}"); fi
-    while read -r a p; do
+    local names=() addrs=() ports=() nums=() a p j n
+    for n in 1 2 3 4 5; do
+        read -r a p <<< "$(_pip_slot_get "$n")"
         [ -z "$a" ] && continue
-        i=$((i+1)); names+=("备用${i}"); addrs+=("$a"); ports+=("${p:-443}")
-    done < <(_pip_bk_list)
+        names+=("ProxyIP ${n}"); addrs+=("$a"); ports+=("${p:-443}"); nums+=("$n")
+    done
     if [ ${#names[@]} -gt 0 ]; then
-        green "当前配置:"
+        green "当前配置 (输入槽位序号可单独测试):"
         for j in "${!names[@]}"; do
-            echo -e " ${green}$((j+1)). ${names[$j]}${re}  ${yellow}$(_pip_hostport "${addrs[$j]}" "${ports[$j]}")${re}$(_pip_src_note "${addrs[$j]}")$([ "${names[$j]}" = "$cur_label" ] && echo '  (当前使用)')"
+            echo -e " ${green}${nums[$j]}.${re} ${yellow}$(_pip_hostport "${addrs[$j]}" "${ports[$j]}")${re}$(_pip_src_note "${addrs[$j]}")$(_pip_slot_tags "${nums[$j]}")"
         done
     else
         yellow "还没有配置 ProxyIP"
     fi
     if [ -s "$(_pip_hf)" ]; then
         echo ""
-        green "最近测速记录 (最多5条，仅供查看；设置主/备用 ProxyIP 时输入对应序号可直接选用):"
+        green "最近测速记录 (最多5条，仅供查看；设置 ProxyIP 槽位时输入对应序号可直接选用):"
         _pip_hist_show
     fi
     echo ""
@@ -462,10 +526,15 @@ speedtest_proxyip_menu() {
         x|X)
             rm -f "$(_pip_hf)"; green "已清空测速记录"; sleep 1; speedtest_proxyip_menu; return ;;
         *)
-            if ! [[ "$sp_choice" =~ ^[0-9]+$ ]] || [ "$sp_choice" -lt 1 ] || [ "$sp_choice" -gt "${#names[@]}" ]; then
+            if ! [[ "$sp_choice" =~ ^[1-5]$ ]]; then
                 red "无效的选择"; sleep 1; speedtest_proxyip_menu; return
             fi
-            tn=("${names[$((sp_choice-1))]}"); ta=("${addrs[$((sp_choice-1))]}"); tp=("${ports[$((sp_choice-1))]}") ;;
+            local si=-1
+            for j in "${!nums[@]}"; do [ "${nums[$j]}" = "$sp_choice" ] && si=$j; done
+            if [ "$si" -lt 0 ]; then
+                red "ProxyIP ${sp_choice} 还没有设置"; sleep 1; speedtest_proxyip_menu; return
+            fi
+            tn=("${names[$si]}"); ta=("${addrs[$si]}"); tp=("${ports[$si]}") ;;
     esac
     reading "是否同时测下载速度？(每个约15秒) (y/N): " sp_dl
     fam=$(_pip_fam)
@@ -521,31 +590,26 @@ proxyip_menu() {
         while IFS=$'\t' read -r t a d; do
             echo -e " - ${skyblue}${t}${re} ${purple}->${re} ${yellow}${a}${re}  ${d}"
         done <<< "$rows"
-        local pa pp nb
-        pa=$(_pip_conf_get P_ADDR); pp=$(_pip_conf_get P_PORT)
-        nb=$(_pip_bk_count)
+    fi
+    local ns pf
+    ns=$(_pip_slot_count); pf=$(_pip_pref)
+    if [ "$ns" -gt 0 ]; then
         echo ""
-        echo -e " 主 ProxyIP: ${yellow}$(_pip_hostport "$pa" "${pp:-443}")${re}$(_pip_src_note "$pa")   当前使用: $(_pip_cur_label)"
-        if [ "$nb" -gt 0 ]; then
-            echo -e " 备用 ProxyIP: ${nb} 个   自动切换: $(_pip_watch_state)"
-        else
-            echo " 备用 ProxyIP: 未设置"
-        fi
+        echo -e " ProxyIP 槽位: ${ns}/5 已设置   当前使用: $(_pip_cur_label)   首选: $([ -n "$pf" ] && echo "ProxyIP ${pf}" || echo 未设置)"
+        echo -e " 自动切换: $(_pip_watch_state)"
     fi
     echo ""
-    green "1. 添加 ProxyIP 分流"
-    red   "2. 删除 ProxyIP 分流"
-    yellow "3. 更换主 ProxyIP (保留规则，批量改地址/端口)"
-    skyblue "4. 备用 ProxyIP / 自动切换"
-    green "5. 测速 (延迟 / 下载速度)"
+    green  "1. 添加 ProxyIP 分流"
+    red    "2. 删除 ProxyIP 分流"
+    skyblue "3. ProxyIP 槽位 / 首选 / 自动切换"
+    green  "4. 测速 (延迟 / 下载速度)"
     purple "0. 返回上级菜单"
     reading "请输入选择: " pip_menu_choice
     case "$pip_menu_choice" in
         1) add_proxyip_route ;;
         2) delete_proxyip_route ;;
-        3) change_proxyip_route ;;
-        4) backup_proxyip_menu ;;
-        5) speedtest_proxyip_menu ;;
+        3) proxyip_slot_menu ;;
+        4) speedtest_proxyip_menu ;;
         0) warp_manage ;;
         *) red "无效选项"; sleep 1; proxyip_menu ;;
     esac
@@ -599,203 +663,206 @@ delete_proxyip_route() {
 
     reload_singbox
     green "\n已删除 ProxyIP 分流 '${tag}'，相关域名恢复原有出站。"
-    # 全部规则删完后，自动切换没有意义：停掉服务并清除主 ProxyIP 状态(备用列表保留)
+    # 全部规则删完后，自动切换没有意义：停掉服务并清除"当前使用"状态(槽位和首选保留)
     if [ -z "$(_pip_list_rules)" ]; then
         _pip_watch_stop
-        local k; for k in P_ADDR P_PORT CUR_ADDR CUR_PORT FAILS OKS; do _pip_conf_del "$k"; done
+        local k; for k in CUR_ADDR CUR_PORT FAILS OKS; do _pip_conf_del "$k"; done
     fi
     sleep 2; proxyip_menu
 }
 
-change_proxyip_route() {
+proxyip_slot_menu() {
     clear
-    green "=== 更换主 ProxyIP ===\n"
-    if [ -z "$(_pip_list_rules)" ]; then
-        yellow "当前没有 ProxyIP 分流规则"; sleep 2; proxyip_menu; return
-    fi
-    yellow "把所有 ProxyIP 分流规则改指向新的 ProxyIP(域名列表不变)，并设为主 ProxyIP。"
-    local pip_addr pip_port fam direct_info pip_info pip_in
-    _pip_read_addr "请输入新的 ProxyIP，可带端口，如 tw.william.us.ci:8443 (不写端口默认443，回车返回): " pip_in
-    [ -z "$pip_in" ] && { proxyip_menu; return; }
-    pip_in=$(echo "$pip_in" | xargs)
-    if ! _pip_parse_addr "$pip_in"; then
-        red "地址或端口格式无效"; sleep 2; proxyip_menu; return
-    fi
-    _pip_probe
-    case $? in
-        0) green "经 ProxyIP:   $(_pip_hostport "$pip_addr" "$pip_port")  ${pip_info}" ;;
-        2) sleep 2; proxyip_menu; return ;;
-        *) red "该 ProxyIP ($(_pip_hostport "$pip_addr" "$pip_port")) 不可用，已取消"; sleep 3; proxyip_menu; return ;;
-    esac
-    _pip_quality_gate "$pip_addr" "$pip_port" "$fam" || { proxyip_menu; return; }
-
-    _pip_apply "$pip_addr" "$pip_port" || { sleep 3; proxyip_menu; return; }
-    _pip_conf_set P_ADDR "$pip_addr"; _pip_conf_set P_PORT "$pip_port"
-    _pip_conf_set CUR_ADDR "$pip_addr"; _pip_conf_set CUR_PORT "$pip_port"
-    _pip_conf_set FAILS 0; _pip_conf_set OKS 0
-    [ -n "$pip_nat64_src" ] && _pip_nat64_save "$pip_addr" "$pip_nat64_src"
-    green "\n已将所有 ProxyIP 分流改为 $(_pip_hostport "$pip_addr" "$pip_port")"
-    sleep 2; proxyip_menu
-}
-
-backup_proxyip_menu() {
-    clear
-    green "=== 备用 ProxyIP / 自动切换 ===\n"
+    green "=== ProxyIP 槽位 / 自动切换 ===\n"
     _pip_sync_conf
-    local pa pp
-    pa=$(_pip_conf_get P_ADDR); pp=$(_pip_conf_get P_PORT)
-    if [ -z "$pa" ]; then
-        yellow "请先添加 ProxyIP 分流规则"; sleep 2; proxyip_menu; return
-    fi
-    local bka=() bkp=() n=0 a p i
-    while read -r a p; do
-        [ -z "$a" ] && continue
-        n=$((n+1)); bka+=("$a"); bkp+=("${p:-443}")
-    done < <(_pip_bk_list)
-    local cur_label; cur_label=$(_pip_cur_label)
-    echo -e " 主 ProxyIP:   ${yellow}$(_pip_hostport "$pa" "${pp:-443}")${re}$(_pip_src_note "$pa")"
-    if [ "$n" -eq 0 ]; then
-        echo " 备用 ProxyIP: 未设置"
-    else
-        for i in "${!bka[@]}"; do echo -e " 备用 $((i+1)):     ${yellow}$(_pip_hostport "${bka[$i]}" "${bkp[$i]}")${re}$(_pip_src_note "${bka[$i]}")"; done
-    fi
-    echo -e " 当前使用:     ${cur_label}"
-    echo -e " 自动切换:     $(_pip_watch_state)"
+    local n a p pf cs ns
+    pf=$(_pip_pref); cs=$(_pip_cur_slot); ns=$(_pip_slot_count)
+    for n in 1 2 3 4 5; do
+        read -r a p <<< "$(_pip_slot_get "$n")"
+        if [ -n "$a" ]; then
+            echo -e " ${green}ProxyIP ${n}:${re} ${yellow}$(_pip_hostport "$a" "$p")${re}$(_pip_src_note "$a")$(_pip_slot_tags "$n")"
+        else
+            echo -e " ${green}ProxyIP ${n}:${re} (空)"
+        fi
+    done
     echo ""
-    green "1. 添加备用 ProxyIP (最多5个，按添加顺序优先)"
-    red   "2. 删除备用 ProxyIP"
-    green "3. 开启自动切换 (主连续不通/过慢时切到可用备用，恢复后自动切回)"
-    red   "4. 关闭自动切换"
-    yellow "5. 手动切换 (主 / 备用)"
-    skyblue "6. 查看切换日志"
-    yellow "7. 设置过慢阈值 (当前 $(_pip_slow_ms)ms：主 ProxyIP 持续慢于此值也视为故障)"
+    echo -e " 当前使用: $(_pip_cur_label)"
+    echo -e " 首选:     $([ -n "$pf" ] && echo "ProxyIP ${pf} (恢复正常后自动切回)" || echo "未设置 (只在当前失效时按 1→2→…→5→1 顺延，不切回)")"
+    echo -e " 自动切换: $(_pip_watch_state)"
+    echo ""
+    green  "1. 设置 / 替换槽位"
+    red    "2. 清空槽位"
+    yellow "3. 设置 / 取消首选"
+    yellow "4. 手动切换"
+    green  "5. 开启自动切换 (当前连续不通/过慢时，切到下一个可用的槽位)"
+    red    "6. 关闭自动切换"
+    skyblue "7. 查看切换日志"
+    yellow "8. 设置过慢阈值 (当前 $(_pip_slow_ms)ms：当前 ProxyIP 持续慢于此值也视为故障)"
     purple "0. 返回"
-    reading "请输入选择: " bk_choice
+    reading "请输入选择: " sl_choice
     local pip_addr pip_port fam direct_info pip_info pip_in
-    case "$bk_choice" in
+    case "$sl_choice" in
         1)
-            if [ "$n" -ge 5 ]; then red "最多添加 5 个备用"; sleep 2; backup_proxyip_menu; return; fi
-            _pip_read_addr "请输入备用 ProxyIP，可带端口 (不写端口默认443，回车返回): " pip_in
-            [ -z "$pip_in" ] && { backup_proxyip_menu; return; }
+            reading "输入槽位序号 (1-5，回车=第一个空槽位，0=返回): " sl_n
+            [ "$sl_n" = "0" ] && { proxyip_slot_menu; return; }
+            if [ -z "$sl_n" ]; then
+                sl_n=$(_pip_slot_first_empty)
+                [ -z "$sl_n" ] && { red "5 个槽位都已占用，请输入要替换的槽位序号"; sleep 2; proxyip_slot_menu; return; }
+            fi
+            if ! [[ "$sl_n" =~ ^[1-5]$ ]]; then red "槽位序号只能是 1-5"; sleep 2; proxyip_slot_menu; return; fi
+            local old_a old_p j oa op
+            read -r old_a old_p <<< "$(_pip_slot_get "$sl_n")"
+            [ -n "$old_a" ] && yellow "ProxyIP ${sl_n} 当前是 $(_pip_hostport "$old_a" "$old_p")，将被替换。"
+            _pip_read_addr "请输入 ProxyIP，可带端口 (不写端口默认443，回车返回): " pip_in
+            [ -z "$pip_in" ] && { proxyip_slot_menu; return; }
             pip_in=$(echo "$pip_in" | xargs)
             if ! _pip_parse_addr "$pip_in"; then
-                red "地址或端口格式无效"; sleep 2; backup_proxyip_menu; return
+                red "地址或端口格式无效"; sleep 2; proxyip_slot_menu; return
             fi
             [ -z "$pip_port" ] && pip_port=443
-            if [ "$pip_addr" = "$pa" ] && [ "$pip_port" = "${pp:-443}" ]; then
-                red "与主 ProxyIP 相同，不能当备用"; sleep 2; backup_proxyip_menu; return
-            fi
-            for i in "${!bka[@]}"; do
-                if [ "${bka[$i]}" = "$pip_addr" ] && [ "${bkp[$i]}" = "$pip_port" ]; then
-                    red "该备用已存在 (备用$((i+1)))"; sleep 2; backup_proxyip_menu; return
+            for j in 1 2 3 4 5; do
+                [ "$j" = "$sl_n" ] && continue
+                read -r oa op <<< "$(_pip_slot_get "$j")"
+                if [ "$oa" = "$pip_addr" ] && [ "$op" = "$pip_port" ]; then
+                    red "该 ProxyIP 已在 ProxyIP ${j} 里"; sleep 2; proxyip_slot_menu; return
                 fi
             done
             _pip_probe
             case $? in
                 0) green "经 ProxyIP:   $(_pip_hostport "$pip_addr" "$pip_port")  ${pip_info}" ;;
-                2) sleep 2; backup_proxyip_menu; return ;;
-                *) red "该 ProxyIP ($(_pip_hostport "$pip_addr" "$pip_port")) 不可用，已取消"; sleep 3; backup_proxyip_menu; return ;;
+                2) sleep 2; proxyip_slot_menu; return ;;
+                *) red "该 ProxyIP ($(_pip_hostport "$pip_addr" "$pip_port")) 不可用，已取消"; sleep 3; proxyip_slot_menu; return ;;
             esac
-            # 防呆：出口 IP 和主 / 其他备用相同就是同一个源，主挂了它也会一起挂，不能当备用
+            # 防呆：出口 IP 和其它槽位相同就是同一个源，它挂了另一个也会一起挂，没有备份意义
             local new_ip o_ip dup=""
             new_ip=$(echo "$pip_info" | sed -n 's/.*ip=\([^ ]*\).*/\1/p')
-            o_ip=$(_pip_trace "" "$pa" "$fam" "${pp:-443}" | sed -n 's/.*ip=\([^ ]*\).*/\1/p')
-            [ -n "$o_ip" ] && [ "$o_ip" = "$new_ip" ] && dup="主 ProxyIP"
-            if [ -z "$dup" ]; then
-                for i in "${!bka[@]}"; do
-                    o_ip=$(_pip_trace "" "${bka[$i]}" "$fam" "${bkp[$i]}" | sed -n 's/.*ip=\([^ ]*\).*/\1/p')
-                    if [ -n "$o_ip" ] && [ "$o_ip" = "$new_ip" ]; then dup="备用$((i+1))"; break; fi
-                done
-            fi
+            for j in 1 2 3 4 5; do
+                [ "$j" = "$sl_n" ] && continue
+                read -r oa op <<< "$(_pip_slot_get "$j")"
+                [ -z "$oa" ] && continue
+                o_ip=$(_pip_trace "" "$oa" "$fam" "$op" | sed -n 's/.*ip=\([^ ]*\).*/\1/p')
+                if [ -n "$o_ip" ] && [ "$o_ip" = "$new_ip" ]; then dup="ProxyIP ${j}"; break; fi
+            done
             if [ -n "$dup" ]; then
-                red "该 ProxyIP 的出口 IP (${new_ip}) 和 ${dup} 相同，属于同一个源，不能当备用。"
-                sleep 4; backup_proxyip_menu; return
+                red "该 ProxyIP 的出口 IP (${new_ip}) 和 ${dup} 相同，属于同一个源，不能放进不同槽位。"
+                sleep 4; proxyip_slot_menu; return
             fi
-            _pip_quality_gate "$pip_addr" "$pip_port" "$fam" || { backup_proxyip_menu; return; }
-            echo "${pip_addr} ${pip_port}" >> "$(_pip_bkf)"
+            _pip_quality_gate "$pip_addr" "$pip_port" "$fam" || { proxyip_slot_menu; return; }
+            # 替换的是正在使用的槽位：规则要同步改指向新地址
+            if [ -n "$old_a" ] && [ "$sl_n" = "$cs" ]; then
+                _pip_switch_addr "$pip_addr" "$pip_port" || { sleep 3; proxyip_slot_menu; return; }
+            fi
+            _pip_slot_set "$sl_n" "$pip_addr" "$pip_port"
             [ -n "$pip_nat64_src" ] && _pip_nat64_save "$pip_addr" "$pip_nat64_src"
-            green "\n已添加备用 ProxyIP: $(_pip_hostport "$pip_addr" "$pip_port") (备用$((n+1)))"
-            if [ "$(_pip_watch_state)" != "运行中" ]; then
-                reading "是否开启自动切换？(Y/n): " bk_auto
-                if [[ "$bk_auto" != "n" && "$bk_auto" != "N" ]]; then
+            green "\n已设置 ProxyIP ${sl_n}: $(_pip_hostport "$pip_addr" "$pip_port")"
+            if [ "$(_pip_slot_count)" -ge 2 ] && [ -n "$(_pip_list_rules)" ] && [ "$(_pip_watch_state)" != "运行中" ]; then
+                reading "是否开启自动切换？(Y/n): " sl_auto
+                if [[ "$sl_auto" != "n" && "$sl_auto" != "N" ]]; then
                     _pip_watch_start && green "自动切换已开启" || red "自动切换开启失败"
                 fi
             fi
-            sleep 2; backup_proxyip_menu ;;
+            sleep 2; proxyip_slot_menu ;;
         2)
-            [ "$n" -eq 0 ] && { yellow "没有备用可删除"; sleep 2; backup_proxyip_menu; return; }
-            reading "输入要删除的备用序号 (回车返回): " bk_del
-            [ -z "$bk_del" ] && { backup_proxyip_menu; return; }
-            if ! [[ "$bk_del" =~ ^[0-9]+$ ]] || [ "$bk_del" -lt 1 ] || [ "$bk_del" -gt "$n" ]; then
-                red "无效的序号"; sleep 1; backup_proxyip_menu; return
+            [ "$ns" -eq 0 ] && { yellow "没有可清空的槽位"; sleep 2; proxyip_slot_menu; return; }
+            reading "输入要清空的槽位序号 (回车返回): " sl_n
+            [ -z "$sl_n" ] && { proxyip_slot_menu; return; }
+            if ! [[ "$sl_n" =~ ^[1-5]$ ]] || [ -z "$(_pip_slot_get "$sl_n")" ]; then
+                red "无效的槽位序号，或该槽位本来就是空的"; sleep 2; proxyip_slot_menu; return
             fi
-            local di=$((bk_del-1))
-            # 要删除的备用正在使用：先切回主 ProxyIP
-            if ! _pip_on_primary && [ "${bka[$di]}" = "$(_pip_conf_get CUR_ADDR)" ] && [ "${bkp[$di]}" = "$(_pip_conf_get CUR_PORT)" ]; then
-                yellow "备用${bk_del} 正在使用，删除前需先切回主 ProxyIP。"
-                fam=$(_pip_fam)
-                if [ -z "$(_pip_trace "" "$pa" "$fam" "${pp:-443}")" ]; then
-                    yellow "主 ProxyIP 当前检测不通，切回后这些域名会暂时打不开。"
-                    reading "仍要切回主并删除？(y/N): " bk_force
-                    [[ "$bk_force" == "y" || "$bk_force" == "Y" ]] || { backup_proxyip_menu; return; }
+            # 正在使用的槽位：先切到别的槽位
+            if [ "$sl_n" = "$cs" ]; then
+                local tgt="" c oa op
+                if [ -n "$pf" ] && [ "$pf" != "$sl_n" ]; then tgt=$pf; fi
+                if [ -z "$tgt" ]; then
+                    for ((j=1; j<=4; j++)); do
+                        c=$(( (sl_n - 1 + j) % 5 + 1 ))
+                        if [ -n "$(_pip_slot_get "$c")" ]; then tgt=$c; break; fi
+                    done
                 fi
-                _pip_switch_addr "$pa" "${pp:-443}" || { sleep 3; backup_proxyip_menu; return; }
+                if [ -z "$tgt" ]; then
+                    red "这是唯一的槽位，且正在使用。要清空它，请先在「2. 删除 ProxyIP 分流」里删掉所有分流规则。"
+                    sleep 4; proxyip_slot_menu; return
+                fi
+                read -r oa op <<< "$(_pip_slot_get "$tgt")"
+                yellow "ProxyIP ${sl_n} 正在使用，清空前需先切换到 ProxyIP ${tgt}。"
+                fam=$(_pip_fam)
+                if [ -z "$(_pip_trace "" "$oa" "$fam" "$op")" ]; then
+                    yellow "ProxyIP ${tgt} 当前检测不通，切过去后这些域名会暂时打不开。"
+                    reading "仍要切换并清空？(y/N): " sl_force
+                    [[ "$sl_force" == "y" || "$sl_force" == "Y" ]] || { proxyip_slot_menu; return; }
+                fi
+                _pip_switch_addr "$oa" "$op" || { sleep 3; proxyip_slot_menu; return; }
             fi
-            : > "$(_pip_bkf)"
-            for i in "${!bka[@]}"; do
-                [ "$i" -ne "$di" ] && echo "${bka[$i]} ${bkp[$i]}" >> "$(_pip_bkf)"
-            done
-            green "已删除备用${bk_del}: ${bka[$di]}:${bkp[$di]}"
-            if [ "$n" -le 1 ]; then _pip_watch_stop; yellow "已无备用，自动切换已关闭。"; fi
-            sleep 2; backup_proxyip_menu ;;
+            _pip_slot_clear "$sl_n"
+            [ "$pf" = "$sl_n" ] && _pip_conf_del PREF
+            green "已清空 ProxyIP ${sl_n}"
+            if [ "$(_pip_slot_count)" -lt 2 ] && [ "$(_pip_watch_state)" = "运行中" ]; then
+                _pip_watch_stop; yellow "槽位不足 2 个，自动切换已关闭。"
+            fi
+            sleep 2; proxyip_slot_menu ;;
         3)
-            [ "$n" -eq 0 ] && { red "请先添加备用 ProxyIP"; sleep 2; backup_proxyip_menu; return; }
-            _pip_watch_start && green "自动切换已开启 (每2分钟检测一次)" || red "自动切换开启失败"
-            sleep 2; backup_proxyip_menu ;;
+            [ "$ns" -eq 0 ] && { yellow "请先设置 ProxyIP 槽位"; sleep 2; proxyip_slot_menu; return; }
+            reading "输入要设为首选的槽位序号 (0=取消首选，回车返回): " sl_n
+            [ -z "$sl_n" ] && { proxyip_slot_menu; return; }
+            if [ "$sl_n" = "0" ]; then
+                _pip_conf_del PREF
+                green "已取消首选：现在只在当前失效时顺延，不再切回。"
+            elif [[ "$sl_n" =~ ^[1-5]$ ]] && [ -n "$(_pip_slot_get "$sl_n")" ]; then
+                _pip_conf_set PREF "$sl_n"; _pip_conf_set OKS 0
+                green "已将 ProxyIP ${sl_n} 设为首选"
+                [ "$sl_n" != "$cs" ] && yellow "当前用的不是它：开启自动切换后，它恢复正常会自动切回；也可以用「4. 手动切换」立即切过去。"
+            else
+                red "无效的槽位序号，或该槽位是空的"
+            fi
+            sleep 3; proxyip_slot_menu ;;
         4)
-            _pip_watch_stop; green "自动切换已关闭"
-            sleep 2; backup_proxyip_menu ;;
-        5)
-            [ "$n" -eq 0 ] && { yellow "没有备用，无法切换"; sleep 2; backup_proxyip_menu; return; }
-            local all_a=("$pa" "${bka[@]}") all_p=("${pp:-443}" "${bkp[@]}") nm j
-            echo ""
-            for j in "${!all_a[@]}"; do
-                nm="主"; [ "$j" -gt 0 ] && nm="备用${j}"
-                echo -e " $((j+1)). ${nm}  $(_pip_hostport "${all_a[$j]}" "${all_p[$j]}")$(_pip_src_note "${all_a[$j]}")$([ "$nm" = "$cur_label" ] && echo '  (当前)')"
-            done
-            reading "输入要切换到的序号 (回车返回): " bk_sw
-            [ -z "$bk_sw" ] && { backup_proxyip_menu; return; }
-            if ! [[ "$bk_sw" =~ ^[0-9]+$ ]] || [ "$bk_sw" -lt 1 ] || [ "$bk_sw" -gt "${#all_a[@]}" ]; then
-                red "无效的序号"; sleep 1; backup_proxyip_menu; return
+            [ -z "$(_pip_list_rules)" ] && { yellow "还没有 ProxyIP 分流规则，请先添加"; sleep 2; proxyip_slot_menu; return; }
+            [ "$ns" -eq 0 ] && { yellow "请先设置 ProxyIP 槽位"; sleep 2; proxyip_slot_menu; return; }
+            reading "输入要切换到的槽位序号 (回车返回): " sl_n
+            [ -z "$sl_n" ] && { proxyip_slot_menu; return; }
+            if ! [[ "$sl_n" =~ ^[1-5]$ ]] || [ -z "$(_pip_slot_get "$sl_n")" ]; then
+                red "无效的槽位序号，或该槽位是空的"; sleep 2; proxyip_slot_menu; return
             fi
-            local si=$((bk_sw-1))
+            if [ "$sl_n" = "$cs" ]; then yellow "已经在使用 ProxyIP ${sl_n}"; sleep 2; proxyip_slot_menu; return; fi
+            local sa sp
+            read -r sa sp <<< "$(_pip_slot_get "$sl_n")"
             fam=$(_pip_fam)
-            if [ -z "$(_pip_trace "" "${all_a[$si]}" "$fam" "${all_p[$si]}")" ]; then
-                yellow "${all_a[$si]}:${all_p[$si]} 当前检测不通。"
-                reading "仍要切换？(y/N): " bk_force
-                [[ "$bk_force" == "y" || "$bk_force" == "Y" ]] || { backup_proxyip_menu; return; }
+            if [ -z "$(_pip_trace "" "$sa" "$fam" "$sp")" ]; then
+                yellow "$(_pip_hostport "$sa" "$sp") 当前检测不通。"
+                reading "仍要切换？(y/N): " sl_force
+                [[ "$sl_force" == "y" || "$sl_force" == "Y" ]] || { proxyip_slot_menu; return; }
             fi
-            if _pip_switch_addr "${all_a[$si]}" "${all_p[$si]}"; then
-                green "已切换到 ${all_a[$si]}:${all_p[$si]}"
-                [ "$(_pip_watch_state)" = "运行中" ] && [ "$si" -gt 0 ] && yellow "提示：自动切换已开启，主 ProxyIP 恢复后会自动切回。"
+            if _pip_switch_addr "$sa" "$sp"; then
+                green "已切换到 ProxyIP ${sl_n}: $(_pip_hostport "$sa" "$sp")"
+                if [ "$(_pip_watch_state)" = "运行中" ] && [ -n "$pf" ] && [ "$pf" != "$sl_n" ]; then
+                    yellow "提示：自动切换已开启且首选是 ProxyIP ${pf}，它恢复正常后会自动切回。"
+                fi
             fi
-            sleep 3; backup_proxyip_menu ;;
+            sleep 3; proxyip_slot_menu ;;
+        5)
+            [ "$ns" -lt 2 ] && { red "至少设置 2 个槽位才能自动切换"; sleep 2; proxyip_slot_menu; return; }
+            [ -z "$(_pip_list_rules)" ] && { red "请先添加 ProxyIP 分流规则"; sleep 2; proxyip_slot_menu; return; }
+            _pip_watch_start && green "自动切换已开启 (每2分钟检测一次)" || red "自动切换开启失败"
+            sleep 2; proxyip_slot_menu ;;
         6)
+            _pip_watch_stop; green "自动切换已关闭"
+            sleep 2; proxyip_slot_menu ;;
+        7)
             local lg="${work_dir}/plugins/proxyip-watch.log"
             echo ""
             if [ -s "$lg" ]; then tail -n 20 "$lg"; else echo "暂无切换记录"; fi
             echo ""
-            reading "按回车返回" bk_any
-            backup_proxyip_menu ;;
-        7)
-            reading "请输入阈值，毫秒 (500-20000，默认3000，回车返回): " bk_slow
-            [ -z "$bk_slow" ] && { backup_proxyip_menu; return; }
-            if ! [[ "$bk_slow" =~ ^[0-9]+$ ]] || [ "$bk_slow" -lt 500 ] || [ "$bk_slow" -gt 20000 ]; then
-                red "请输入 500-20000 之间的整数"; sleep 2; backup_proxyip_menu; return
+            reading "按回车返回" sl_any
+            proxyip_slot_menu ;;
+        8)
+            reading "请输入阈值，毫秒 (500-20000，默认3000，回车返回): " sl_slow
+            [ -z "$sl_slow" ] && { proxyip_slot_menu; return; }
+            if ! [[ "$sl_slow" =~ ^[0-9]+$ ]] || [ "$sl_slow" -lt 500 ] || [ "$sl_slow" -gt 20000 ]; then
+                red "请输入 500-20000 之间的整数"; sleep 2; proxyip_slot_menu; return
             fi
-            _pip_conf_set SLOW_MS "$bk_slow"
-            green "已设置：首字节延迟持续超过 ${bk_slow}ms 视为过慢"
-            sleep 2; backup_proxyip_menu ;;
+            _pip_conf_set SLOW_MS "$sl_slow"
+            green "已设置：首字节延迟持续超过 ${sl_slow}ms 视为过慢"
+            sleep 2; proxyip_slot_menu ;;
         *) proxyip_menu ;;
     esac
 }
@@ -815,14 +882,19 @@ add_proxyip_route() {
     fi
 
     _pip_sync_conf
-    local pip_addr pip_port fam direct_info pip_info pip_in reuse=0
+    local pip_addr pip_port fam direct_info pip_info pip_in reuse=0 from_slot=""
     local pip_re_dom='^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
-    if [ -n "$(_pip_list_rules)" ] && [ -n "$(_pip_conf_get P_ADDR)" ]; then
+    if [ -n "$(_pip_list_rules)" ] && [ -n "$(_pip_conf_get CUR_ADDR)" ]; then
         # 已有规则：所有规则共用同一个 ProxyIP，新规则沿用当前正在使用的那个
         reuse=1
         pip_addr=$(_pip_conf_get CUR_ADDR); pip_port=$(_pip_conf_get CUR_PORT)
-        [ -z "$pip_addr" ] && { pip_addr=$(_pip_conf_get P_ADDR); pip_port=$(_pip_conf_get P_PORT); }
         yellow "已有 ProxyIP 分流，新规则沿用当前 ProxyIP: $(_pip_hostport "$pip_addr" "${pip_port:-443}")"
+    elif [ "$(_pip_slot_count)" -gt 0 ]; then
+        # 还没有规则但已设置过槽位：用首选，没有首选就用编号最小的槽位
+        from_slot=$(_pip_pref)
+        [ -z "$from_slot" ] && from_slot=$(awk 'NF>=2{print $1; exit}' "$(_pip_sf)")
+        read -r pip_addr pip_port <<< "$(_pip_slot_get "$from_slot")"
+        yellow "使用 ProxyIP ${from_slot}: $(_pip_hostport "$pip_addr" "${pip_port:-443}")"
     else
         _pip_read_addr "请输入 ProxyIP，可带端口，如 tw.william.us.ci 或 tw.william.us.ci:8443 (不写端口默认443，回车返回): " pip_in
         [ -z "$pip_in" ] && { proxyip_menu; return; }
@@ -847,7 +919,7 @@ add_proxyip_route() {
         [[ "$go_on" == "y" || "$go_on" == "Y" ]] || { proxyip_menu; return; }
     fi
 
-    if [ "$reuse" -eq 0 ]; then
+    if [ "$reuse" -eq 0 ] && [ -z "$from_slot" ]; then
         _pip_quality_gate "$pip_addr" "$pip_port" "$fam" || { proxyip_menu; return; }
     fi
 
@@ -927,14 +999,17 @@ add_proxyip_route() {
     rm -f "${route_file}.bak"
 
     reload_singbox
-    # 第一条规则：把这个 ProxyIP 记为主 ProxyIP (之后添加的规则沿用当前使用的 ProxyIP)
+    # 第一条规则：记录当前使用的 ProxyIP；若是刚输入的新地址，同时存为 ProxyIP 1 (之后添加的规则沿用当前使用的)
     if [ "$reuse" -eq 0 ]; then
-        _pip_conf_set P_ADDR "$pip_addr"; _pip_conf_set P_PORT "$pip_port"
+        if [ -z "$from_slot" ]; then
+            _pip_slot_set 1 "$pip_addr" "$pip_port"
+            [ -n "$pip_nat64_src" ] && _pip_nat64_save "$pip_addr" "$pip_nat64_src"
+        fi
         _pip_conf_set CUR_ADDR "$pip_addr"; _pip_conf_set CUR_PORT "$pip_port"
         _pip_conf_set FAILS 0; _pip_conf_set OKS 0
-        [ -n "$pip_nat64_src" ] && _pip_nat64_save "$pip_addr" "$pip_nat64_src"
     fi
     green "\n已添加 ProxyIP 分流 '${tag}' -> $(_pip_hostport "$pip_addr" "$pip_port")，域名: ${ok_domains[*]}"
+    [ "$(_pip_slot_count)" -lt 2 ] && yellow "提示：在「3. ProxyIP 槽位」里最多可再设置 4 个 ProxyIP，开启自动切换后，当前这个不通时会按顺序切到下一个。"
     yellow "提示：已同时拦截这些域名的 UDP/443(QUIC)，让浏览器回退到 TCP，否则 QUIC 会绕过 ProxyIP。"
     yellow "验证：客户端连上节点后访问 https://chatgpt.com/cdn-cgi/trace 之类 (对应站点的 /cdn-cgi/trace)，查看 ip= 是否为 ProxyIP 的出口。"
     sleep 3; proxyip_menu
@@ -999,19 +1074,19 @@ PIP_INJECT_EOF
 write_watch() {
 cat > "${plugin_dir}/proxyip-watch.sh.tmp" <<'PIP_WATCH_EOF'
 #!/bin/bash
-# sing-box ProxyIP 主备自动切换守护进程（由 sb-proxyip 服务运行：bash proxyip-watch.sh daemon）
-# 每轮检测当前使用的 ProxyIP；主连续不通 -> 按顺序切到第一个可用备用；主恢复并连续正常 -> 切回主；
-# 正在用的备用也坏了 -> 优先切回可用的主，否则换下一个可用备用。
+# sing-box ProxyIP 槽位自动切换守护进程（由 sb-proxyip 服务运行：bash proxyip-watch.sh daemon）
+# 槽位 ProxyIP 1-5：当前使用的连续不通/过慢 -> 先看首选(如有)，再按 1→2→…→5→1 环形顺延，切到第一个可用的槽位；
+# 设了首选且当前用的不是它：首选恢复并连续正常 -> 切回首选。不设首选就不切回。
 # 本机网络自身异常(直连 cloudflare.com 都不通)时不做任何判定，避免误切换。
 work_dir="$(cd "$(dirname "$0")/.." && pwd)"
 conf_dir="${work_dir}/conf"
 route_file="${conf_dir}/route.json"
 cf="${work_dir}/plugins/proxyip.conf"
-bkf="${work_dir}/plugins/proxyip.backups"
+sf="${work_dir}/plugins/proxyip.slots"
 logf="${work_dir}/plugins/proxyip-watch.log"
 INTERVAL=${PIP_INTERVAL:-120}       # 检测间隔(秒)
-FAIL_LIMIT=${PIP_FAIL_LIMIT:-2}     # 连续几轮不通才切到备用
-BACK_LIMIT=${PIP_BACK_LIMIT:-2}     # 主恢复后连续几轮正常才切回
+FAIL_LIMIT=${PIP_FAIL_LIMIT:-2}     # 当前 ProxyIP 连续几轮不通/过慢才切走
+BACK_LIMIT=${PIP_BACK_LIMIT:-2}     # 首选恢复后连续几轮正常才切回
 
 log() {
     echo "$(date '+%F %T') $*" >> "$logf"
@@ -1080,14 +1155,25 @@ apply() {
     return 1
 }
 
-bka=(); bkp=()
-load_backups() {
-    bka=(); bkp=()
-    local a p
-    while read -r a p; do
+# 槽位：sn=序号 sa=地址 sp=端口 (按序号升序)
+sn=(); sa=(); sp=()
+load_slots() {
+    sn=(); sa=(); sp=()
+    local n a p
+    while read -r n a p; do
         [ -z "$a" ] && continue
-        bka+=("$a"); bkp+=("${p:-443}")
-    done < "$bkf" 2>/dev/null
+        sn+=("$n"); sa+=("$a"); sp+=("${p:-443}")
+    done < <(sort -n "$sf" 2>/dev/null)
+}
+idx_of_slot() {   # $1=槽位序号 -> 数组下标，没有输出 -1
+    local i
+    for i in "${!sn[@]}"; do [ "${sn[$i]}" = "$1" ] && { echo "$i"; return 0; }; done
+    echo -1
+}
+idx_of_addr() {   # $1=地址 $2=端口 -> 数组下标，没有输出 -1
+    local i
+    for i in "${!sa[@]}"; do [ "${sa[$i]}" = "$1" ] && [ "${sp[$i]}" = "$2" ] && { echo "$i"; return 0; }; done
+    echo -1
 }
 # 切换到 $1:$2 并记为当前使用；$3=日志说明
 switch_to() {
@@ -1098,59 +1184,66 @@ switch_to() {
     fi
     return 1
 }
-# 按顺序找第一个可用的备用并切换；$1/$2=要跳过的(当前使用的)地址/端口
-try_backups() {
-    local i
-    for i in "${!bka[@]}"; do
-        [ "${bka[$i]}" = "$1" ] && [ "${bkp[$i]}" = "$2" ] && continue
-        if good "${bka[$i]}" "${bkp[$i]}"; then
-            switch_to "${bka[$i]}" "${bkp[$i]}" "已切换到备用$((i+1))" && return 0
-        fi
-    done
-    return 1
-}
 
 tick() {
-    local pa pp ca cp fails oks
-    pa=$(get P_ADDR); pp=$(get P_PORT); ca=$(get CUR_ADDR); cp=$(get CUR_PORT)
-    [ -n "$pa" ] || return 0
-    pp=${pp:-443}; ca=${ca:-$pa}; cp=${cp:-$pp}
+    local ca cp fails oks pref pi ci n k i
     SLOW_MS=$(get SLOW_MS); SLOW_MS=${SLOW_MS:-${PIP_SLOW_MS:-3000}}
-    load_backups
-    [ ${#bka[@]} -gt 0 ] || return 0
+    load_slots
+    n=${#sa[@]}
+    [ "$n" -ge 2 ] || return 0
     has_rules || return 0
     net_ok || return 0
+    ca=$(get CUR_ADDR); cp=$(get CUR_PORT)
+    if [ -z "$ca" ]; then
+        # 状态里没有当前使用的地址：取路由规则里正在用的
+        ca=$(jq -r '[.route.rules[]? | select(.override_address != null)][0].override_address // empty' "$route_file" 2>/dev/null)
+        cp=$(jq -r '[.route.rules[]? | select(.override_address != null)][0].override_port // 443' "$route_file" 2>/dev/null)
+        [ -n "$ca" ] || return 0
+        put CUR_ADDR "$ca"; put CUR_PORT "$cp"
+    fi
+    cp=${cp:-443}
     fails=$(get FAILS); oks=$(get OKS); fails=${fails:-0}; oks=${oks:-0}
+    ci=$(idx_of_addr "$ca" "$cp")
+    pref=$(get PREF); pi=-1
+    [ -n "$pref" ] && pi=$(idx_of_slot "$pref")
 
-    if [ "$ca" = "$pa" ] && [ "$cp" = "$pp" ]; then
-        # 正在用主 ProxyIP
-        if good "$pa" "$pp"; then put FAILS 0; return 0; fi
-        fails=$((fails+1)); put FAILS "$fails"
-        log "主 ProxyIP ${pa}:${pp} $(ms_txt) (${fails}/${FAIL_LIMIT})"
-        if [ "$fails" -ge "$FAIL_LIMIT" ]; then
-            try_backups "" "" || log "所有备用 ProxyIP 都不通或过慢，保持不变"
-        fi
-    else
-        # 正在用某个备用
-        if ! good "$ca" "$cp"; then
-            # 当前备用坏了：主如果可用就切回，否则换下一个可用备用
-            if good "$pa" "$pp"; then
-                switch_to "$pa" "$pp" "当前备用不通或过慢，主 ProxyIP 可用，已切回主"
+    if good "$ca" "$cp"; then
+        put FAILS 0
+        if [ "$pi" -ge 0 ] && [ "$pi" != "$ci" ]; then
+            # 设了首选且当前用的不是它：看首选是否恢复
+            if good "${sa[$pi]}" "${sp[$pi]}"; then
+                oks=$((oks+1)); put OKS "$oks"
+                if [ "$oks" -ge "$BACK_LIMIT" ]; then
+                    switch_to "${sa[$pi]}" "${sp[$pi]}" "首选 ProxyIP ${pref} 已恢复，切回"
+                fi
             else
-                try_backups "$ca" "$cp" || log "主、备 ProxyIP 均不通"
+                put OKS 0
             fi
-            return 0
-        fi
-        # 当前备用正常：看主是否恢复
-        if good "$pa" "$pp"; then
-            oks=$((oks+1)); put OKS "$oks"
-            if [ "$oks" -ge "$BACK_LIMIT" ]; then
-                switch_to "$pa" "$pp" "主 ProxyIP 已恢复，切回主"
-            fi
-        else
+        elif [ "$oks" -ne 0 ]; then
             put OKS 0
         fi
+        return 0
     fi
+
+    # 当前 ProxyIP 不通/过慢：连续 FAIL_LIMIT 轮才切走
+    fails=$((fails+1)); put FAILS "$fails"
+    log "当前 ProxyIP ${ca}:${cp} $(ms_txt) (${fails}/${FAIL_LIMIT})"
+    [ "$fails" -ge "$FAIL_LIMIT" ] || return 0
+    put OKS 0
+    # 先看首选能不能用
+    if [ "$pi" -ge 0 ] && [ "$pi" != "$ci" ] && good "${sa[$pi]}" "${sp[$pi]}"; then
+        switch_to "${sa[$pi]}" "${sp[$pi]}" "当前不通或过慢，已切到首选 ProxyIP ${pref}" && return 0
+    fi
+    # 再按 1→2→…→5→1 从当前的下一个开始环形找第一个可用的
+    for ((k=1; k<=n; k++)); do
+        if [ "$ci" -ge 0 ]; then i=$(( (ci+k) % n )); else i=$((k-1)); fi
+        [ "$i" = "$ci" ] && continue
+        [ "$i" = "$pi" ] && continue      # 首选上面已经测过
+        if good "${sa[$i]}" "${sp[$i]}"; then
+            switch_to "${sa[$i]}" "${sp[$i]}" "当前不通或过慢，已切换到 ProxyIP ${sn[$i]}" && return 0
+        fi
+    done
+    log "所有槽位的 ProxyIP 都不通或过慢，保持不变"
 }
 
 case "$1" in
@@ -1218,6 +1311,12 @@ install_plugin() {
         ln -sf "$wrapper" /usr/bin/sb && touch "${plugin_dir}/sb_link_created"
     fi
 
+    # 旧版(主 + 备用)状态迁移为槽位：在重启自动切换服务前完成，新守护进程才能读到槽位
+    (
+        route_file="${work_dir}/conf/route.json"
+        source "${plugin_dir}/proxyip.sh"
+        _pip_sync_conf
+    ) 2>/dev/null
     # 更新插件时，自动切换服务若在运行则重启以使用新脚本
     if [ -z "$SB_WORK_DIR" ] && command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet sb-proxyip 2>/dev/null; then
         systemctl restart sb-proxyip >/dev/null 2>&1
@@ -1313,7 +1412,7 @@ uninstall_plugin() {
 
     # 4) 删除插件文件
     rm -f "${plugin_dir}/proxyip.sh" "${plugin_dir}/proxyip-inject.sh" "${plugin_dir}/proxyip-watch.sh" "${plugin_dir}/proxyip-watch.sh.tmp" \
-          "${plugin_dir}/proxyip.conf" "${plugin_dir}/proxyip.backups" "${plugin_dir}/proxyip.history" "${plugin_dir}/proxyip.nat64" "${plugin_dir}/proxyip.nat64.tmp" "${plugin_dir}/proxyip-watch.log" \
+          "${plugin_dir}/proxyip.conf" "${plugin_dir}/proxyip.backups" "${plugin_dir}/proxyip.slots" "${plugin_dir}/proxyip.slots.tmp" "${plugin_dir}/proxyip.history" "${plugin_dir}/proxyip.nat64" "${plugin_dir}/proxyip.nat64.tmp" "${plugin_dir}/proxyip-watch.log" \
           "${plugin_dir}/proxyip-watch.log.tmp"
     # main_url / sb 链接标记为各插件共用, 其它插件还在就保留
     [ "$others" = 0 ] && rm -f "${plugin_dir}/main_url" "${plugin_dir}/sb_link_created"
