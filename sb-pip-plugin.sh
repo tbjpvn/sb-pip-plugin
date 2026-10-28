@@ -344,8 +344,8 @@ _pip_cur_label() {
 }
 # 槽位标记：★首选 ▶当前使用   $1=槽位序号
 _pip_slot_tags() {
-    [ "$1" = "$(_pip_pref)" ] && printf '  ★首选'
-    [ "$1" = "$(_pip_cur_slot)" ] && printf '  ▶当前使用'
+    [ "$1" = "$(_pip_pref)" ] && printf '  %s★首选%s' "$green" "$re"
+    [ "$1" = "$(_pip_cur_slot)" ] && printf '  %s▶当前使用%s' "$green" "$re"
     return 0
 }
 # 自动切换的过慢阈值(毫秒)，默认3000
@@ -726,13 +726,13 @@ proxyip_slot_menu() {
         if [ -n "$a" ]; then
             echo -e " ${green}ProxyIP ${n}:${re} ${yellow}$(_pip_hostport "$a" "$p")${re}$(_pip_src_note "$a")$(_pip_slot_tags "$n")"
         else
-            echo -e " ${green}ProxyIP ${n}:${re} (空)"
+            echo -e " ${green}ProxyIP ${n}:${re} ${yellow}(空)${re}"
         fi
     done
     echo ""
-    echo -e " 当前使用: $(_pip_cur_label)"
-    echo -e " 首选:     $([ -n "$pf" ] && echo "ProxyIP ${pf} (恢复正常后自动切回)" || echo "未设置 (只在当前失效时按 1→2→…→5→1 顺延，不切回)")"
-    echo -e " 自动切换: $(_pip_watch_state)"
+    yellow " 当前使用: $(_pip_cur_label)"
+    yellow " 首选:     $([ -n "$pf" ] && echo "ProxyIP ${pf} (恢复正常后自动切回)" || echo "未设置 (只在当前失效时按 1→2→…→5→1 顺延，不切回)")"
+    yellow " 自动切换: $(_pip_watch_state)"
     echo ""
     green  "1. 设置 / 替换槽位"
     red    "2. 清空槽位"
