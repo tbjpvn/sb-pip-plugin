@@ -1,15 +1,6 @@
 #!/bin/bash
 # =========================================================
-# sing-box.sh 插件：公共 ProxyIP 分流（单文件，用链接安装）
-#
-# 安装/更新: bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh)
-# 卸载:      bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh) -u
-#
-# 原理：sb 快捷指令每次都会从 GitHub 拉取最新主脚本运行，本机没有主脚本文件可改。
-#       安装时把 /etc/sing-box/sb.sh 换成带插件的版本：拉取主脚本 -> 自动在
-#       「WARP分流管理」菜单末尾追加本插件入口(序号=现有最大序号+1) -> 再运行。
-#       主脚本本身不被修改；插入失败时自动回退为原样运行。
-# 注意：只对 sb 命令生效；直接用链接运行主脚本时没有此菜单。
+# sb-pip-plugin.sh
 # =========================================================
 export LANG=en_US.UTF-8
 work_dir="${SB_WORK_DIR:-/etc/sing-box}"
