@@ -435,7 +435,7 @@ _pip_hist_show() {
         addr_s="$a"; [[ "$a" == *:* ]] && addr_s="[${a}]"
         if [ "$f" -ge "$n" ] 2>/dev/null; then lat_s="全部超时(${f}/${n})"; else lat_s="平均${avg}ms 最高${mx}ms 超时${f}/${n}"; fi
         if [ -z "$dl" ] || [ "$dl" = "-" ]; then dl_s="下载 未测"; else dl_s="下载 ${dl}Mbps"; fi
-        echo -e " ${skyblue}${i}.${re} ${yellow}${addr_s}:${p}${re}$(_pip_src_note "$a")  ${lat_s}  ${dl_s}  ${t}"
+        echo -e " ${skyblue}${i}.${re} ${yellow}${addr_s}:${p}${re}$(_pip_src_note "$a")  ${skyblue}${lat_s}  ${dl_s}  ${t}${re}"
     done < <(head -n 5 "$(_pip_hf)")
 }
 
@@ -470,15 +470,15 @@ _pip_hist_fmt() {
 _pip_cfg_show() {
     local n a p pf cs tags="" cnt=0 title="当前配置"
     pf=$(_pip_pref); cs=$(_pip_cur_slot)
-    [ -n "$pf" ] && tags+="  ★首选 ${pf}"
-    [ -n "$cs" ] && tags+="  ▶当前使用 ${cs}"
+    [ -n "$pf" ] && tags+="  ${yellow}★首选${re} ${green}${pf}${re}"
+    [ -n "$cs" ] && tags+="  ${yellow}▶当前使用${re} ${green}${cs}${re}"
     [ "$1" = 1 ] && title+=" (输入槽位序号可单独测试)"
     for n in 1 2 3 4 5; do
         read -r a p <<< "$(_pip_slot_get "$n")"
         [ -z "$a" ] && continue
         if [ "$cnt" -eq 0 ]; then echo -e "${green}${title}:${re}${tags}"; fi
         cnt=$((cnt+1))
-        echo -e " ${green}${n}.${re} ${yellow}$(_pip_hostport "$a" "$p")${re}$(_pip_src_note "$a")  $(_pip_hist_fmt "$(_pip_hist_find "$a" "$p")")"
+        echo -e " ${green}${n}.${re} ${yellow}$(_pip_hostport "$a" "$p")${re}$(_pip_src_note "$a")  ${skyblue}$(_pip_hist_fmt "$(_pip_hist_find "$a" "$p")")${re}"
     done
     [ "$cnt" -eq 0 ] && { yellow "还没有配置 ProxyIP"; return 1; }
     return 0
