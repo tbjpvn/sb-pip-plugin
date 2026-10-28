@@ -736,12 +736,12 @@ proxyip_slot_menu() {
     echo ""
     green  "1. 设置 / 替换槽位"
     red    "2. 清空槽位"
-    yellow "3. 设置 / 取消首选"
-    yellow "4. 手动切换"
+    green  "3. 设置 / 取消首选"
+    green  "4. 手动切换"
     green  "5. 开启自动切换 (当前连续不通/过慢时，切到下一个可用的槽位)"
     red    "6. 关闭自动切换"
     skyblue "7. 查看切换日志"
-    yellow "8. 设置过慢阈值 (当前 $(_pip_slow_ms)ms：当前 ProxyIP 持续慢于此值也视为故障)"
+    green  "8. 设置过慢阈值 (当前 $(_pip_slow_ms)ms：当前 ProxyIP 持续慢于此值也视为故障)"
     purple "0. 返回"
     reading "请输入选择: " sl_choice
     local pip_addr pip_port fam direct_info pip_info pip_in
