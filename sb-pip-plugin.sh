@@ -342,16 +342,33 @@ _pip_cur_label() {
     ca=$(_pip_conf_get CUR_ADDR); cp=$(_pip_conf_get CUR_PORT)
     if [ -n "$ca" ]; then _pip_hostport "$ca" "${cp:-443}"; else echo "未使用"; fi
 }
-# 当前使用的 ProxyIP 所在区域(按地址做 IP 归属地查询，结果按地址缓存；查不到显示"未知")
+# 查 ProxyIP 地址的归属地(国家+时区)，按地址缓存到 REGION_ADDR/REGION_TXT/REGION_TZ；查不到则不写
+_pip_geo_fetch() {
+    local ca=$1 j r tz
+    j=$(curl -s --connect-timeout 3 -m 4 "http://ip-api.com/json/${ca}?fields=status,country,countryCode,timezone&lang=zh-CN" 2>/dev/null)
+    r=$(echo "$j" | jq -r 'select(.status=="success") | "\(.country) (\(.countryCode))"' 2>/dev/null)
+    tz=$(echo "$j" | jq -r 'select(.status=="success") | .timezone // empty' 2>/dev/null)
+    [ -z "$r" ] && return 1
+    _pip_conf_set REGION_ADDR "$ca"; _pip_conf_set REGION_TXT "$r"; _pip_conf_set REGION_TZ "$tz"
+    return 0
+}
+# 当前使用的 ProxyIP 所在区域；查不到显示"未知"
 _pip_cur_region() {
-    local ca r; ca=$(_pip_conf_get CUR_ADDR)
+    local ca; ca=$(_pip_conf_get CUR_ADDR)
     [ -z "$ca" ] && { echo "未知"; return 0; }
-    if [ "$(_pip_conf_get REGION_ADDR)" = "$ca" ]; then
-        r=$(_pip_conf_get REGION_TXT); [ -n "$r" ] && { echo "$r"; return 0; }
+    if [ "$(_pip_conf_get REGION_ADDR)" != "$ca" ] || [ -z "$(_pip_conf_get REGION_TZ)" ]; then
+        _pip_geo_fetch "$ca" || { echo "未知"; return 0; }
     fi
-    r=$(curl -s --connect-timeout 3 -m 4 "http://ip-api.com/json/${ca}?fields=status,country,countryCode&lang=zh-CN" 2>/dev/null \
-        | jq -r 'select(.status=="success") | "\(.country) (\(.countryCode))"' 2>/dev/null)
-    if [ -n "$r" ]; then _pip_conf_set REGION_ADDR "$ca"; _pip_conf_set REGION_TXT "$r"; echo "$r"; else echo "未知"; fi
+    _pip_conf_get REGION_TXT
+}
+# 日志时区显示文字
+_pip_logtz_label() {
+    if [ "$(_pip_conf_get LOG_TZ)" = proxyip ]; then
+        local tz; tz=$(_pip_conf_get REGION_TZ)
+        echo "ProxyIP 所在时区${tz:+ ($tz)}"
+    else
+        echo "VPS 本机时区 ($(date +%Z))"
+    fi
 }
 # 槽位标记：★首选代理 ▶当前使用   $1=槽位序号
 _pip_slot_tags() {
@@ -428,12 +445,29 @@ _pip_watch_stop() {
 # 测速记录：最近5条，proxyip.history，每行 地址<TAB>端口<TAB>平均ms<TAB>最高ms<TAB>超时<TAB>次数<TAB>下载Mbps(未测为-)<TAB>时间
 _pip_hf() { echo "${work_dir}/plugins/proxyip.history"; }
 
+# 日志/测速记录用的时区：LOG_TZ=proxyip 时取当前 ProxyIP 所在时区(查不到/本机没有 tzdata 则无输出，退回 VPS 时区)
+_pip_ts_tz() {
+    [ "$(_pip_conf_get LOG_TZ)" = proxyip ] || return 0
+    local ca tz; ca=$(_pip_conf_get CUR_ADDR); [ -z "$ca" ] && return 0
+    if [ "$(_pip_conf_get REGION_ADDR)" != "$ca" ] || [ -z "$(_pip_conf_get REGION_TZ)" ]; then
+        _pip_geo_fetch "$ca" || return 0
+    fi
+    tz=$(_pip_conf_get REGION_TZ)
+    [ -n "$tz" ] && [ -e "/usr/share/zoneinfo/${tz}" ] && echo "$tz"
+    return 0
+}
+# 当前时间戳(带时区缩写，避免切换时区后新旧记录混淆)
+_pip_now() {
+    local tz; tz=$(_pip_ts_tz)
+    if [ -n "$tz" ]; then TZ="$tz" date '+%m-%d %H:%M %Z'; else date '+%m-%d %H:%M %Z'; fi
+}
+
 # $1=地址 $2=端口 $3=平均ms $4=最高ms $5=超时 $6=次数 $7=下载Mbps(可空)；同一地址端口只保留最新一条
 _pip_hist_add() {
     local hf; hf=$(_pip_hf)
     mkdir -p "$(dirname "$hf")"
     {
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "${7:--}" "$(date '+%m-%d %H:%M')"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "${7:--}" "$(_pip_now)"
         [ -f "$hf" ] && awk -F'\t' -v a="$1" -v p="$2" '!($1==a && $2==p)' "$hf"
     } | head -n 10 > "${hf}.tmp" && mv -f "${hf}.tmp" "$hf"   # 存10条(5个槽位的数据不容易被挤掉)，列表只显示最近5条
 }
@@ -628,6 +662,28 @@ speedtest_proxyip_menu() {
     speedtest_proxyip_menu
 }
 
+# 切换日志 / 测速记录使用的时区(插件全局)：VPS 本机时区 <-> 当前 ProxyIP 所在时区
+proxyip_tz_toggle() {
+    if [ "$(_pip_conf_get LOG_TZ)" = proxyip ]; then
+        _pip_conf_del LOG_TZ
+        green "日志和测速记录时间已改为 VPS 本机时区 ($(date +%Z))"
+    else
+        _pip_conf_set LOG_TZ proxyip
+        _pip_cur_region >/dev/null
+        local ltz; ltz=$(_pip_conf_get REGION_TZ)
+        if [ -z "$(_pip_conf_get CUR_ADDR)" ]; then
+            yellow "已设为 ProxyIP 所在时区；当前还没有使用中的 ProxyIP，有了之后生效，期间仍用 VPS 时区"
+        elif [ -z "$ltz" ]; then
+            yellow "已设为 ProxyIP 所在时区，但暂时查不到当前 ProxyIP 的时区，查到之前仍用 VPS 时区"
+        elif [ ! -e "/usr/share/zoneinfo/${ltz}" ]; then
+            yellow "已设为 ProxyIP 所在时区 (${ltz})，但本机缺少时区数据(tzdata)，暂仍用 VPS 时区；可安装 tzdata 后生效"
+        else
+            green "日志和测速记录时间已改为 ProxyIP 所在时区 (${ltz})"
+        fi
+    fi
+    sleep 2
+}
+
 proxyip_menu() {
     route_file="${conf_dir}/route.json"
     _pip_sync_conf
@@ -659,6 +715,7 @@ proxyip_menu() {
     red    "2. 删除 ProxyIP 分流"
     green  "3. ProxyIP 槽位 / 首选代理 / 自动切换"
     green  "4. 测速 (延迟 / 下载速度)"
+    green  "5. 切换日志 / 测速时区 (当前: $(_pip_logtz_label))"
     purple "0. 返回上级菜单"
     reading "请输入选择: " pip_menu_choice
     case "$pip_menu_choice" in
@@ -666,6 +723,7 @@ proxyip_menu() {
         2) delete_proxyip_route ;;
         3) proxyip_slot_menu ;;
         4) speedtest_proxyip_menu ;;
+        5) proxyip_tz_toggle; proxyip_menu ;;
         0) warp_manage ;;
         *) red "无效选项"; sleep 1; proxyip_menu ;;
     esac
@@ -1145,8 +1203,26 @@ INTERVAL=${PIP_INTERVAL:-120}       # 检测间隔(秒)
 FAIL_LIMIT=${PIP_FAIL_LIMIT:-2}     # 当前 ProxyIP 连续几轮不通/过慢才切走
 BACK_LIMIT=${PIP_BACK_LIMIT:-2}     # 首选代理恢复后连续几轮正常才切回
 
+# 日志时区：LOG_TZ=proxyip 时用当前 ProxyIP 所在时区(按地址缓存，查不到/本机没有 tzdata 则退回 VPS 时区)
+log_tz() {
+    [ "$(get LOG_TZ)" = proxyip ] || return 0
+    local ca tz j; ca=$(get CUR_ADDR); [ -z "$ca" ] && return 0
+    [ "$(get REGION_ADDR)" = "$ca" ] && tz=$(get REGION_TZ)
+    if [ -z "$tz" ]; then
+        j=$(curl -s --connect-timeout 3 -m 4 "http://ip-api.com/json/${ca}?fields=status,country,countryCode,timezone&lang=zh-CN" 2>/dev/null)
+        tz=$(echo "$j" | jq -r 'select(.status=="success") | .timezone // empty' 2>/dev/null)
+        if [ -n "$tz" ]; then
+            put REGION_ADDR "$ca"; put REGION_TZ "$tz"
+            put REGION_TXT "$(echo "$j" | jq -r '"\(.country) (\(.countryCode))"' 2>/dev/null)"
+        fi
+    fi
+    [ -n "$tz" ] && [ -e "/usr/share/zoneinfo/${tz}" ] && echo "$tz"
+    return 0
+}
 log() {
-    echo "$(date '+%F %T') $*" >> "$logf"
+    local tz ts; tz=$(log_tz)
+    if [ -n "$tz" ]; then ts=$(TZ="$tz" date '+%F %T %Z'); else ts=$(date '+%F %T %Z'); fi
+    echo "${ts} $*" >> "$logf"
     if [ "$(wc -l < "$logf" 2>/dev/null || echo 0)" -gt 300 ]; then
         tail -n 150 "$logf" > "${logf}.tmp" && mv "${logf}.tmp" "$logf"
     fi
