@@ -569,7 +569,7 @@ speedtest_proxyip_menu() {
     echo ""
     green "测试选项:"
     echo -e " ${green}1. 测试当前配置${re}"
-    echo -e " ${green}2. 批量测试其他地址 (域名/IP[:端口]，空格分隔，不写端口默认443，写一个就是单个测试)${re}"
+    echo -e " ${green}2. 测试其他地址 (域名/IP[:端口]，不写端口默认443，批量空格分隔)${re}"
     echo -e " ${green}x. 清空测速记录${re}"
     echo -e " ${purple}0. 返回上级菜单${re}"
     reading "请输入选择: " sp_choice
@@ -705,9 +705,9 @@ proxyip_menu() {
     echo ""
     green  "1. 添加 ProxyIP 分流"
     red    "2. 删除 ProxyIP 分流"
-    green  "3. ProxyIP 槽位 / 首选代理 / 自动切换"
-    green  "4. 测速 (延迟 / 下载速度)"
-    green  "5. 切换测速 / 日志时区 (当前: $(_pip_logtz_label))"
+    green  "3. ProxyIP 设置"
+    green  "4. ProxyIP 测速"
+    green  "5. 时区切换 (供测速与日志使用 当前: $(_pip_logtz_label))"
     purple "0. 返回上级菜单"
     reading "请输入选择: " pip_menu_choice
     case "$pip_menu_choice" in
@@ -797,9 +797,9 @@ proxyip_slot_menu() {
     echo -e " ${green}当前区域:${re} ${yellow}$(_pip_cur_region)${re}"
     echo -e " ${green}自动切换:${re} ${yellow}$(_pip_watch_state)${re}"
     echo ""
-    green  "1. 设置 / 替换槽位"
+    green  "1. 设置槽位"
     red    "2. 清空槽位"
-    green  "3. 设置 / 取消首选代理"
+    green  "3. 设置首选"
     green  "4. 手动切换"
     green  "5. 开启自动切换 (当前连续不通/过慢时，切到下一个可用的槽位)"
     red    "6. 关闭自动切换"
