@@ -707,7 +707,7 @@ proxyip_menu() {
     red    "2. 删除 ProxyIP 分流"
     green  "3. ProxyIP 槽位 / 首选代理 / 自动切换"
     green  "4. 测速 (延迟 / 下载速度)"
-    green  "5. 切换日志 / 测速时区 (当前: $(_pip_logtz_label))"
+    green  "5. 切换测速 / 日志时区 (当前: $(_pip_logtz_label))"
     purple "0. 返回上级菜单"
     reading "请输入选择: " pip_menu_choice
     case "$pip_menu_choice" in
