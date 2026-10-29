@@ -58,10 +58,10 @@ _pip_list_rules() {
     ' "$route_file" 2>/dev/null
 }
 
-# 槽位 / 首选 / 当前使用 的状态：
+# 槽位 / 首选代理 / 当前使用 的状态：
 #   proxyip.slots 每行 "序号 地址 端口" (序号 1-5，空槽位不写)
-#   proxyip.conf  PREF=首选槽位序号(没有=不设首选) CUR_ADDR/CUR_PORT=当前正在使用的 ProxyIP
-# 旧版(主 + 备用列表)自动迁移：原来的主 -> 槽位1 并设为首选，备用依次放到 2-5
+#   proxyip.conf  PREF=首选代理槽位序号(没有=不设首选代理) CUR_ADDR/CUR_PORT=当前正在使用的 ProxyIP
+# 旧版(主 + 备用列表)自动迁移：原来的主 -> 槽位1 并设为首选代理，备用依次放到 2-5
 _pip_sync_conf() {
     local sf la=() lp=() a p row has_pri=0 ob_a ob_p ca cp i k pf
     sf=$(_pip_sf)
@@ -100,7 +100,7 @@ _pip_sync_conf() {
         for k in P_ADDR P_PORT B_ADDR B_PORT CURRENT; do _pip_conf_del "$k"; done
         rm -f "$(_pip_bkf)"
     fi
-    # 首选必须指向已配置的槽位
+    # 首选代理必须指向已配置的槽位
     pf=$(_pip_conf_get PREF)
     if [ -n "$pf" ] && [ -z "$(_pip_slot_get "$pf")" ]; then _pip_conf_del PREF; fi
     # 状态里没有当前使用的地址时，取路由规则里正在用的
@@ -322,7 +322,7 @@ _pip_slot_first_empty() {
     done
     return 0
 }
-# 首选槽位序号(没设或指向空槽位则无输出)
+# 首选代理槽位序号(没设或指向空槽位则无输出)
 _pip_pref() {
     local v; v=$(_pip_conf_get PREF)
     [ -n "$v" ] && [ -n "$(_pip_slot_get "$v")" ] && echo "$v"
@@ -342,9 +342,20 @@ _pip_cur_label() {
     ca=$(_pip_conf_get CUR_ADDR); cp=$(_pip_conf_get CUR_PORT)
     if [ -n "$ca" ]; then _pip_hostport "$ca" "${cp:-443}"; else echo "未使用"; fi
 }
-# 槽位标记：★首选 ▶当前使用   $1=槽位序号
+# 当前使用的 ProxyIP 所在区域(按地址做 IP 归属地查询，结果按地址缓存；查不到显示"未知")
+_pip_cur_region() {
+    local ca r; ca=$(_pip_conf_get CUR_ADDR)
+    [ -z "$ca" ] && { echo "未知"; return 0; }
+    if [ "$(_pip_conf_get REGION_ADDR)" = "$ca" ]; then
+        r=$(_pip_conf_get REGION_TXT); [ -n "$r" ] && { echo "$r"; return 0; }
+    fi
+    r=$(curl -s --connect-timeout 3 -m 4 "http://ip-api.com/json/${ca}?fields=status,country,countryCode&lang=zh-CN" 2>/dev/null \
+        | jq -r 'select(.status=="success") | "\(.country) (\(.countryCode))"' 2>/dev/null)
+    if [ -n "$r" ]; then _pip_conf_set REGION_ADDR "$ca"; _pip_conf_set REGION_TXT "$r"; echo "$r"; else echo "未知"; fi
+}
+# 槽位标记：★首选代理 ▶当前使用   $1=槽位序号
 _pip_slot_tags() {
-    [ "$1" = "$(_pip_pref)" ] && printf '  %s★首选%s' "$green" "$re"
+    [ "$1" = "$(_pip_pref)" ] && printf '  %s★首选代理%s' "$green" "$re"
     [ "$1" = "$(_pip_cur_slot)" ] && printf '  %s▶当前使用%s' "$skyblue" "$re"
     return 0
 }
@@ -465,12 +476,12 @@ _pip_hist_fmt() {
     printf '%s  %s  %s' "$lat_s" "$dl_s" "$t"
 }
 
-# 显示当前配置(槽位)：标题后面跟 ★首选 N ▶当前使用 N，每个槽位后面跟最近一次测速数据
+# 显示当前配置(槽位)：标题后面跟 ★首选代理 N ▶当前使用 N，每个槽位后面跟最近一次测速数据
 # $1=1 时标题带"(输入槽位序号可单独测试)"；没有任何槽位返回 1
 _pip_cfg_show() {
     local n a p pf cs tags="" cnt=0 title="当前配置"
     pf=$(_pip_pref); cs=$(_pip_cur_slot)
-    [ -n "$pf" ] && tags+="  ${yellow}★首选${re} ${green}${pf}${re}"
+    [ -n "$pf" ] && tags+="  ${yellow}★首选代理${re} ${green}${pf}${re}"
     [ -n "$cs" ] && tags+="  ${yellow}▶当前使用${re} ${green}${cs}${re}"
     [ "$1" = 1 ] && title+=" (输入槽位序号可单独测试)"
     for n in 1 2 3 4 5; do
@@ -638,14 +649,15 @@ proxyip_menu() {
     if [ "$ns" -gt 0 ]; then
         echo ""
         yellow " ProxyIP 槽位: ${ns}/5 已设置"
-        yellow " 首选: $([ -n "$pf" ] && echo "ProxyIP ${pf}" || echo 未设置)"
+        yellow " 首选代理: $([ -n "$pf" ] && echo "ProxyIP ${pf}" || echo 未设置)"
         yellow " 当前使用: $(_pip_cur_label)"
+        yellow " 当前区域: $(_pip_cur_region)"
         yellow " 自动切换: $(_pip_watch_state)"
     fi
     echo ""
     green  "1. 添加 ProxyIP 分流"
     red    "2. 删除 ProxyIP 分流"
-    green  "3. ProxyIP 槽位 / 首选 / 自动切换"
+    green  "3. ProxyIP 槽位 / 首选代理 / 自动切换"
     green  "4. 测速 (延迟 / 下载速度)"
     purple "0. 返回上级菜单"
     reading "请输入选择: " pip_menu_choice
@@ -707,7 +719,7 @@ delete_proxyip_route() {
 
     reload_singbox
     green "\n已删除 ProxyIP 分流 '${tag}'，相关域名恢复原有出站。"
-    # 全部规则删完后，自动切换没有意义：停掉服务并清除"当前使用"状态(槽位和首选保留)
+    # 全部规则删完后，自动切换没有意义：停掉服务并清除"当前使用"状态(槽位和首选代理保留)
     if [ -z "$(_pip_list_rules)" ]; then
         _pip_watch_stop
         local k; for k in CUR_ADDR CUR_PORT FAILS OKS; do _pip_conf_del "$k"; done
@@ -731,12 +743,13 @@ proxyip_slot_menu() {
     done
     echo ""
     yellow " 当前使用: $(_pip_cur_label)"
-    yellow " 首选:     $([ -n "$pf" ] && echo "ProxyIP ${pf} (恢复正常后自动切回)" || echo "未设置 (只在当前失效时按 1→2→…→5→1 顺延，不切回)")"
+    yellow " 当前区域: $(_pip_cur_region)"
+    yellow " 首选代理: $([ -n "$pf" ] && echo "ProxyIP ${pf} (恢复正常后自动切回)" || echo "未设置 (只在当前失效时按 1→2→…→5→1 顺延，不切回)")"
     yellow " 自动切换: $(_pip_watch_state)"
     echo ""
     green  "1. 设置 / 替换槽位"
     red    "2. 清空槽位"
-    green  "3. 设置 / 取消首选"
+    green  "3. 设置 / 取消首选代理"
     green  "4. 手动切换"
     green  "5. 开启自动切换 (当前连续不通/过慢时，切到下一个可用的槽位)"
     red    "6. 关闭自动切换"
@@ -846,14 +859,14 @@ proxyip_slot_menu() {
             sleep 2; proxyip_slot_menu ;;
         3)
             [ "$ns" -eq 0 ] && { yellow "请先设置 ProxyIP 槽位"; sleep 2; proxyip_slot_menu; return; }
-            reading "输入要设为首选的槽位序号 (0=取消首选，回车返回): " sl_n
+            reading "输入要设为首选代理的槽位序号 (0=取消首选代理，回车返回): " sl_n
             [ -z "$sl_n" ] && { proxyip_slot_menu; return; }
             if [ "$sl_n" = "0" ]; then
                 _pip_conf_del PREF
-                green "已取消首选：现在只在当前失效时顺延，不再切回。"
+                green "已取消首选代理：现在只在当前失效时顺延，不再切回。"
             elif [[ "$sl_n" =~ ^[1-5]$ ]] && [ -n "$(_pip_slot_get "$sl_n")" ]; then
                 _pip_conf_set PREF "$sl_n"; _pip_conf_set OKS 0
-                green "已将 ProxyIP ${sl_n} 设为首选"
+                green "已将 ProxyIP ${sl_n} 设为首选代理"
                 [ "$sl_n" != "$cs" ] && yellow "当前用的不是它：开启自动切换后，它恢复正常会自动切回；也可以用「4. 手动切换」立即切过去。"
             else
                 red "无效的槽位序号，或该槽位是空的"
@@ -879,7 +892,7 @@ proxyip_slot_menu() {
             if _pip_switch_addr "$sa" "$sp"; then
                 green "已切换到 ProxyIP ${sl_n}: $(_pip_hostport "$sa" "$sp")"
                 if [ "$(_pip_watch_state)" = "运行中" ] && [ -n "$pf" ] && [ "$pf" != "$sl_n" ]; then
-                    yellow "提示：自动切换已开启且首选是 ProxyIP ${pf}，它恢复正常后会自动切回。"
+                    yellow "提示：自动切换已开启且首选代理是 ProxyIP ${pf}，它恢复正常后会自动切回。"
                 fi
             fi
             sleep 3; proxyip_slot_menu ;;
@@ -934,7 +947,7 @@ add_proxyip_route() {
         pip_addr=$(_pip_conf_get CUR_ADDR); pip_port=$(_pip_conf_get CUR_PORT)
         yellow "已有 ProxyIP 分流，新规则沿用当前 ProxyIP: $(_pip_hostport "$pip_addr" "${pip_port:-443}")"
     elif [ "$(_pip_slot_count)" -gt 0 ]; then
-        # 还没有规则但已设置过槽位：用首选，没有首选就用编号最小的槽位
+        # 还没有规则但已设置过槽位：用首选代理，没有首选代理就用编号最小的槽位
         from_slot=$(_pip_pref)
         [ -z "$from_slot" ] && from_slot=$(awk 'NF>=2{print $1; exit}' "$(_pip_sf)")
         read -r pip_addr pip_port <<< "$(_pip_slot_get "$from_slot")"
@@ -1119,8 +1132,8 @@ write_watch() {
 cat > "${plugin_dir}/proxyip-watch.sh.tmp" <<'PIP_WATCH_EOF'
 #!/bin/bash
 # sing-box ProxyIP 槽位自动切换守护进程（由 sb-proxyip 服务运行：bash proxyip-watch.sh daemon）
-# 槽位 ProxyIP 1-5：当前使用的连续不通/过慢 -> 先看首选(如有)，再按 1→2→…→5→1 环形顺延，切到第一个可用的槽位；
-# 设了首选且当前用的不是它：首选恢复并连续正常 -> 切回首选。不设首选就不切回。
+# 槽位 ProxyIP 1-5：当前使用的连续不通/过慢 -> 先看首选代理(如有)，再按 1→2→…→5→1 环形顺延，切到第一个可用的槽位；
+# 设了首选代理且当前用的不是它：首选代理恢复并连续正常 -> 切回首选代理。不设首选代理就不切回。
 # 本机网络自身异常(直连 cloudflare.com 都不通)时不做任何判定，避免误切换。
 work_dir="$(cd "$(dirname "$0")/.." && pwd)"
 conf_dir="${work_dir}/conf"
@@ -1130,7 +1143,7 @@ sf="${work_dir}/plugins/proxyip.slots"
 logf="${work_dir}/plugins/proxyip-watch.log"
 INTERVAL=${PIP_INTERVAL:-120}       # 检测间隔(秒)
 FAIL_LIMIT=${PIP_FAIL_LIMIT:-2}     # 当前 ProxyIP 连续几轮不通/过慢才切走
-BACK_LIMIT=${PIP_BACK_LIMIT:-2}     # 首选恢复后连续几轮正常才切回
+BACK_LIMIT=${PIP_BACK_LIMIT:-2}     # 首选代理恢复后连续几轮正常才切回
 
 log() {
     echo "$(date '+%F %T') $*" >> "$logf"
@@ -1254,11 +1267,11 @@ tick() {
     if good "$ca" "$cp"; then
         put FAILS 0
         if [ "$pi" -ge 0 ] && [ "$pi" != "$ci" ]; then
-            # 设了首选且当前用的不是它：看首选是否恢复
+            # 设了首选代理且当前用的不是它：看首选代理是否恢复
             if good "${sa[$pi]}" "${sp[$pi]}"; then
                 oks=$((oks+1)); put OKS "$oks"
                 if [ "$oks" -ge "$BACK_LIMIT" ]; then
-                    switch_to "${sa[$pi]}" "${sp[$pi]}" "首选 ProxyIP ${pref} 已恢复，切回"
+                    switch_to "${sa[$pi]}" "${sp[$pi]}" "首选代理 ProxyIP ${pref} 已恢复，切回"
                 fi
             else
                 put OKS 0
@@ -1274,15 +1287,15 @@ tick() {
     log "当前 ProxyIP ${ca}:${cp} $(ms_txt) (${fails}/${FAIL_LIMIT})"
     [ "$fails" -ge "$FAIL_LIMIT" ] || return 0
     put OKS 0
-    # 先看首选能不能用
+    # 先看首选代理能不能用
     if [ "$pi" -ge 0 ] && [ "$pi" != "$ci" ] && good "${sa[$pi]}" "${sp[$pi]}"; then
-        switch_to "${sa[$pi]}" "${sp[$pi]}" "当前不通或过慢，已切到首选 ProxyIP ${pref}" && return 0
+        switch_to "${sa[$pi]}" "${sp[$pi]}" "当前不通或过慢，已切到首选代理 ProxyIP ${pref}" && return 0
     fi
     # 再按 1→2→…→5→1 从当前的下一个开始环形找第一个可用的
     for ((k=1; k<=n; k++)); do
         if [ "$ci" -ge 0 ]; then i=$(( (ci+k) % n )); else i=$((k-1)); fi
         [ "$i" = "$ci" ] && continue
-        [ "$i" = "$pi" ] && continue      # 首选上面已经测过
+        [ "$i" = "$pi" ] && continue      # 首选代理上面已经测过
         if good "${sa[$i]}" "${sp[$i]}"; then
             switch_to "${sa[$i]}" "${sp[$i]}" "当前不通或过慢，已切换到 ProxyIP ${sn[$i]}" && return 0
         fi
