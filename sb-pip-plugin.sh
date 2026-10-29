@@ -1,6 +1,15 @@
 #!/bin/bash
 # =========================================================
-# sb-pip-plugin
+# sing-box.sh 插件：公共 ProxyIP 分流（单文件，用链接安装）
+#
+# 安装/更新: bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh)
+# 卸载:      bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库/main/proxyip.sh) -u
+#
+# 原理：sb 快捷指令每次都会从 GitHub 拉取最新主脚本运行，本机没有主脚本文件可改。
+#       安装时把 /etc/sing-box/sb.sh 换成带插件的版本：拉取主脚本 -> 自动在
+#       「WARP分流管理」菜单末尾追加本插件入口(序号=现有最大序号+1) -> 再运行。
+#       主脚本本身不被修改；插入失败时自动回退为原样运行。
+# 注意：只对 sb 命令生效；直接用链接运行主脚本时没有此菜单。
 # =========================================================
 export LANG=en_US.UTF-8
 work_dir="${SB_WORK_DIR:-/etc/sing-box}"
@@ -695,11 +704,11 @@ proxyip_menu() {
     ns=$(_pip_slot_count); pf=$(_pip_pref)
     if [ "$ns" -gt 0 ]; then
         echo ""
-        yellow " ProxyIP 槽位: ${ns}/5 已设置"
-        yellow " 首选代理: $([ -n "$pf" ] && echo "ProxyIP ${pf}" || echo 未设置)"
-        yellow " 当前使用: $(_pip_cur_label)"
-        yellow " 当前区域: $(_pip_cur_region)"
-        yellow " 自动切换: $(_pip_watch_state)"
+        echo -e " ${green}ProxyIP 槽位:${re} ${yellow}${ns}/5 已设置${re}"
+        echo -e " ${green}首选代理:${re} ${yellow}$([ -n "$pf" ] && echo "ProxyIP ${pf}" || echo 未设置)${re}"
+        echo -e " ${green}当前使用:${re} ${yellow}$(_pip_cur_label)${re}"
+        echo -e " ${green}当前区域:${re} ${yellow}$(_pip_cur_region)${re}"
+        echo -e " ${green}自动切换:${re} ${yellow}$(_pip_watch_state)${re}"
     fi
     echo ""
     green  "1. 添加 ProxyIP 分流"
@@ -791,10 +800,10 @@ proxyip_slot_menu() {
         fi
     done
     echo ""
-    yellow " 当前使用: $(_pip_cur_label)"
-    yellow " 当前区域: $(_pip_cur_region)"
-    yellow " 首选代理: $([ -n "$pf" ] && echo "ProxyIP ${pf} (恢复正常后自动切回)" || echo "未设置 (只在当前失效时按 1→2→…→5→1 顺延，不切回)")"
-    yellow " 自动切换: $(_pip_watch_state)"
+    echo -e " ${green}当前使用:${re} ${yellow}$(_pip_cur_label)${re}"
+    echo -e " ${green}当前区域:${re} ${yellow}$(_pip_cur_region)${re}"
+    echo -e " ${green}首选代理:${re} ${yellow}$([ -n "$pf" ] && echo "ProxyIP ${pf} (恢复正常后自动切回)" || echo "未设置 (只在当前失效时按 1→2→…→5→1 顺延，不切回)")${re}"
+    echo -e " ${green}自动切换:${re} ${yellow}$(_pip_watch_state)${re}"
     echo ""
     green  "1. 设置 / 替换槽位"
     red    "2. 清空槽位"
