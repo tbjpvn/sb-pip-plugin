@@ -599,7 +599,7 @@ speedtest_proxyip_menu() {
                     tn=("${names[$si]}"); ta=("${addrs[$si]}"); tp=("${ports[$si]}") ;;
             esac ;;
         2)
-            reading "请输入多个地址，空格分隔，不写端口默认443\n(如: a.com b.com:8443 1.2.3.4，回车返回本页)\n> " sp_in
+            read -p "$(yellow "请输入地址，不写端口默认443，批量空格分隔(如: proxyip.com 3.4.5.6:8443，回车返回本页): ")" sp_in
             [ -z "$sp_in" ] && { speedtest_proxyip_menu; return; }
             for tok in $sp_in; do
                 if _pip_parse_addr "$tok"; then
