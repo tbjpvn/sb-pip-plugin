@@ -455,12 +455,22 @@ _pip_now() {
 
 # $1=地址 $2=端口 $3=平均ms $4=最高ms $5=超时 $6=次数 $7=下载Mbps(可空)；同一地址端口只保留最新一条
 _pip_hist_add() {
-    local hf; hf=$(_pip_hf)
+    local hf nf sf tmp files=(); hf=$(_pip_hf); nf=$(_pip_nf); sf=$(_pip_sf); tmp="${hf}.new"
     mkdir -p "$(dirname "$hf")"
     {
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "${7:--}" "$(_pip_now)"
         [ -f "$hf" ] && awk -F'\t' -v a="$1" -v p="$2" '!($1==a && $2==p)' "$hf"
-    } | head -n 10 > "${hf}.tmp" && mv -f "${hf}.tmp" "$hf"   # 存10条(5个槽位的数据不容易被挤掉)，列表只显示最近5条
+    } > "$tmp"
+    [ -f "$sf" ] && files+=("$sf")
+    [ -f "$nf" ] && files+=("$nf")
+    # 已配置槽位(含其 NAT64 合成地址)的记录永远保留；其他地址的记录只留最近10条，
+    # 否则批量测一批其他地址会把槽位的测速数据挤掉，显示成"未测速"
+    awk -F'[ \t]+' -v sf="$sf" -v nf="$nf" -v mx=10 '
+        FILENAME==sf { if (NF>=2) k[$2 SUBSEP ($3==""?443:$3)]=1; next }
+        FILENAME==nf { for (x in k) { split(x, pp, SUBSEP); if (pp[1]==$2) add[$1 SUBSEP pp[2]]=1 } for (x in add) k[x]=1; next }
+        { if (($1 SUBSEP $2) in k) print; else if (++o<=mx) print }
+    ' "${files[@]}" "$tmp" > "${hf}.tmp" && mv -f "${hf}.tmp" "$hf"
+    rm -f "$tmp"
 }
 
 _pip_hist_show() {
@@ -918,7 +928,28 @@ proxyip_slot_menu() {
             elif [[ "$sl_n" =~ ^[1-5]$ ]] && [ -n "$(_pip_slot_get "$sl_n")" ]; then
                 _pip_conf_set PREF "$sl_n"; _pip_conf_set OKS 0
                 green "已将 ProxyIP ${sl_n} 设为首选代理"
-                [ "$sl_n" != "$cs" ] && yellow "当前用的不是它：开启自动切换后，它恢复正常会自动切回；也可以用「4. 手动切换」立即切过去。"
+                if [ "$sl_n" != "$cs" ]; then
+                    if [ -z "$(_pip_list_rules)" ]; then
+                        yellow "当前用的不是它，但还没有 ProxyIP 分流规则，添加规则后会使用首选代理。"
+                    else
+                        reading "当前用的不是它，是否立即切换到 ProxyIP ${sl_n}？(y/N): " sl_now
+                        if [[ "$sl_now" == "y" || "$sl_now" == "Y" ]]; then
+                            local pa pp
+                            read -r pa pp <<< "$(_pip_slot_get "$sl_n")"
+                            fam=$(_pip_fam)
+                            sl_force=y
+                            if [ -z "$(_pip_trace "" "$pa" "$fam" "$pp")" ]; then
+                                yellow "$(_pip_hostport "$pa" "$pp") 当前检测不通。"
+                                reading "仍要切换？(y/N): " sl_force
+                            fi
+                            if [[ "$sl_force" == "y" || "$sl_force" == "Y" ]]; then
+                                _pip_switch_addr "$pa" "$pp" && green "已切换到 ProxyIP ${sl_n}: $(_pip_hostport "$pa" "$pp")"
+                            fi
+                        else
+                            yellow "未切换：开启自动切换后，它恢复正常会自动切回；也可以用「4. 手动切换」。"
+                        fi
+                    fi
+                fi
             else
                 red "无效的槽位序号，或该槽位是空的"
             fi
