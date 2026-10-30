@@ -932,7 +932,7 @@ proxyip_slot_menu() {
                     if [ -z "$(_pip_list_rules)" ]; then
                         yellow "当前用的不是它，但还没有 ProxyIP 分流规则，添加规则后会使用首选代理。"
                     else
-                        reading "当前用的不是它，是否立即切换到 ProxyIP ${sl_n}？(Y/n): " sl_now
+                        reading "当前用的不是它，是否立即切换到 ProxyIP ${sl_n}？(Y/n，直接回车=立即切换，输入 n 不切换): " sl_now
                         if [[ -z "$sl_now" || "$sl_now" == "y" || "$sl_now" == "Y" ]]; then
                             local pa pp
                             read -r pa pp <<< "$(_pip_slot_get "$sl_n")"
