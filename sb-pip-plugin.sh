@@ -1163,7 +1163,8 @@ END { if (!(m && c && t)) exit 3 }
 ' "$tmp" > "$out" || passthrough
 
 # 删除列表去重(每个规则名对应两条路由规则)；匹配不到则不改动
-sed -i 's/map(select(\. != "telegram-ip")) | \.\[\]/map(select(. != "telegram-ip")) | unique | .[]/' "$out" 2>/dev/null
+sed -i 's/\(map(select(\. != "telegram-ip"[^)]*)) | \)\.\[\]/\1unique | .[]/' "$out" 2>/dev/null
+grep -q '| unique | \.\[\]' "$out" || echo "[proxyip插件] 警告: 删除列表去重补丁未生效，主脚本可能已更新，删除菜单可能出现重复项" >&2
 
 # 已启用规则集列表里 ProxyIP 规则显示 ProxyIP:地址，而不是 direct；匹配不到则不改动
 sed -i 's/\\(\$r\.outbound)"/\\(if $r.override_address != null then "ProxyIP:" + $r.override_address + ":" + ($r.override_port | tostring) else $r.outbound end)"/' "$out" 2>/dev/null
