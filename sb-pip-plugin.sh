@@ -741,19 +741,25 @@ delete_proxyip_route() {
     if ! [[ "$pip_del" =~ ^[0-9]+$ ]] || [ "$pip_del" -lt 1 ] || [ "$pip_del" -gt "${#tags[@]}" ]; then
         red "无效的选择"; sleep 1; proxyip_menu; return
     fi
-    local tag="${tags[$((pip_del-1))]}"
+    local tag="${tags[$((pip_del-1))]}" del_tags del_json
+    del_tags=("$tag")
+    case "$tag" in
+        gemini)   del_tags=(gemini gemini-dm gemini-gm) ;;
+        telegram) del_tags=(telegram telegram-ip) ;;
+    esac
+    del_json=$(printf '%s\n' "${del_tags[@]}" | jq -R . | jq -s .)
     cp -f "$route_file" "${route_file}.bak"
-    jq_write "$route_file" --arg tag "$tag" '
+    jq_write "$route_file" --argjson dt "$del_json" '
       .route.rules = (
         [{"action":"sniff"}]
         + [
             .route.rules[]?
             | select(.action != "sniff")
-            | if .rule_set != null then .rule_set = [.rule_set[] | select(. != $tag)] else . end
+            | if .rule_set != null then .rule_set = [.rule_set[] | select(. as $x | ($dt | index($x)) == null)] else . end
             | select((.rule_set | type) != "array" or (.rule_set | length) > 0)
           ]
       )
-      | .route.rule_set = [(.route.rule_set // [])[] | select(.tag != $tag)]
+      | .route.rule_set = [(.route.rule_set // [])[] | select((.type == "inline" and (.tag as $g | ($dt | index($g)) != null)) | not)]
     '
 
     _pip_route_commit || { sleep 3; proxyip_menu; return; }
@@ -1118,6 +1124,176 @@ add_proxyip_route() {
     sleep 3; proxyip_menu
 }
 
+# ---- 接入主脚本「设置分流服务」(钩子) ----
+# 内核版本是否满足 override_address (1.11.0+)；取不到版本时放行
+_pip_core_ok() {
+    local v
+    v=$("${work_dir}/sing-box" version 2>/dev/null | awk 'NR==1{print $3}')
+    [ -z "$v" ] || [ "$(printf '%s\n1.11.0\n' "$v" | sort -V | head -n1)" = "1.11.0" ]
+}
+
+# 经 ProxyIP 检测某域名：优先 CF trace；非CF站点(Google/YouTube/Netflix 等)退而检查能否完成 HTTPS(证书按域名校验)
+# $1=域名 $2=ProxyIP $3=IP族 $4=ProxyIP端口 -> pip_chk_info
+_pip_check_host() {
+    local host=$1 pip=$2 fam=$3 port=${4:-443} h code
+    pip_chk_info=$(_pip_trace "$host" "$pip" "$fam" "$port")
+    [ -n "$pip_chk_info" ] && return 0
+    h=$pip; [[ "$h" == *:* ]] && h="[${h}]"
+    code=$(curl -s -o /dev/null $fam --connect-timeout 5 -m 10 --connect-to "${host}:443:${h}:${port}" -w '%{http_code}' "https://${host}/" 2>/dev/null)
+    case "$code" in
+        ""|000) return 1 ;;
+    esac
+    pip_chk_info="HTTP ${code}"
+    return 0
+}
+
+# 内置服务的代表域名 (内置规则集是远程列表，取一个代表域名检测)
+_pip_rep_host() {
+    case "$1" in
+        openai)   echo chatgpt.com ;;
+        claude)   echo claude.ai ;;
+        gemini)   echo gemini.google.com ;;
+        google)   echo www.google.com ;;
+        tiktok)   echo www.tiktok.com ;;
+        twitter)  echo x.com ;;
+        youtube)  echo www.youtube.com ;;
+        netflix)  echo www.netflix.com ;;
+        telegram) echo web.telegram.org ;;
+    esac
+}
+
+# 选定本次使用的 ProxyIP -> 设置调用者的 pip_addr pip_port reuse from_slot；0=继续 1=取消 (逻辑同「添加 ProxyIP 分流」)
+_pip_pick_addr() {
+    reuse=0; from_slot=""; pip_in=""
+    if [ -n "$(_pip_list_rules)" ] && [ -n "$(_pip_conf_get CUR_ADDR)" ]; then
+        reuse=1
+        pip_addr=$(_pip_conf_get CUR_ADDR); pip_port=$(_pip_conf_get CUR_PORT)
+        yellow "已有 ProxyIP 分流，新规则沿用当前 ProxyIP: $(_pip_hostport "$pip_addr" "${pip_port:-443}")"
+    elif [ "$(_pip_slot_count)" -gt 0 ]; then
+        from_slot=$(_pip_pref)
+        [ -z "$from_slot" ] && from_slot=$(awk 'NF>=2{print $1; exit}' "$(_pip_sf)")
+        read -r pip_addr pip_port <<< "$(_pip_slot_get "$from_slot")"
+        yellow "使用 ProxyIP ${from_slot}: $(_pip_hostport "$pip_addr" "${pip_port:-443}")"
+    else
+        _pip_read_addr "请输入 ProxyIP，可带端口，如 tw.william.us.ci 或 tw.william.us.ci:8443 (不写端口默认443，回车取消): " pip_in
+        [ -z "$pip_in" ] && return 1
+        pip_in=$(echo "$pip_in" | xargs)
+        if ! _pip_parse_addr "$pip_in"; then
+            red "地址或端口格式无效"; sleep 2; return 1
+        fi
+    fi
+    return 0
+}
+
+# 取消时清掉"自定义分流"刚写入、但没有任何规则引用的内联规则集定义
+_pip_cancel_pending() {
+    local t
+    for t in "$@"; do
+        jq -e --arg t "$t" '.route.rule_set[]? | select(.tag == $t and .type == "inline")' "$route_file" >/dev/null 2>&1 || continue
+        jq -e --arg t "$t" '.route.rules[]? | select((.rule_set // []) | index($t))' "$route_file" >/dev/null 2>&1 && continue
+        jq_write "$route_file" --arg t "$t" '.route.rule_set = [.route.rule_set[]? | select(.tag != $t)]'
+    done
+}
+
+# 钩子: 在「设置分流服务」选出站时追加 ProxyIP 选项 (所有分流服务和自定义分流都提供)
+sbhook_rule_extra_choices__proxyip() {
+    [ -n "$1" ] || return 0
+    _pip_core_ok || return 0
+    printf 'proxyip\tProxyIP (插件，公共中转)\n'
+}
+
+# 钩子: 用户选中 ProxyIP 后接管建立规则；$1=proxyip $2...=规则集tag (gemini 为 gemini gemini-dm gemini-gm，telegram 为 telegram telegram-ip)
+sbhook_rule_extra_commit__proxyip() {
+    [ "$1" = proxyip ] || return 0
+    shift
+    local tags=("$@") main_tag="$1"
+    [ -n "$main_tag" ] || return 0
+    route_file="${conf_dir}/route.json"
+    local pip_addr pip_port fam direct_info pip_info pip_in pip_nat64_src reuse=0 from_slot="" go_on q_go
+    local hosts=() ok_hosts=() d
+
+    clear
+    green "=== ProxyIP 分流: ${main_tag} ===\n"
+    yellow "说明：ProxyIP 只是一个能中转TCP的地址，不是代理协议；对方服务器能看到你访问的域名，稳定性取决于对方\n"
+    _pip_sync_conf
+    _pip_pick_addr || { _pip_cancel_pending "${tags[@]}"; yellow "已取消"; return 0; }
+    _pip_probe
+    case $? in
+        0) ;;
+        2) _pip_cancel_pending "${tags[@]}"; sleep 2; return 0 ;;
+        *) red "该 ProxyIP ($(_pip_hostport "$pip_addr" "$pip_port")) 不可用，已取消 (若它用的不是443端口，请写成 域名:端口)"
+           _pip_cancel_pending "${tags[@]}"; sleep 3; return 0 ;;
+    esac
+    green "经 ProxyIP:   $(_pip_hostport "$pip_addr" "$pip_port")  ${pip_info}"
+    if [ "$(_pip_ip_of "$direct_info")" = "$(_pip_ip_of "$pip_info")" ]; then
+        yellow "\n两者出口IP相同：该 ProxyIP 没有改变出口，分流没有意义。"
+        reading "仍要继续？(y/N): " go_on
+        _pip_yes "$go_on" || { _pip_cancel_pending "${tags[@]}"; return 0; }
+    fi
+    if [ "$reuse" -eq 0 ] && [ -z "$from_slot" ]; then
+        _pip_quality_gate "$pip_addr" "$pip_port" "$fam" || { _pip_cancel_pending "${tags[@]}"; return 0; }
+    fi
+
+    # 要检测的域名：自定义规则取其全部域名，内置服务取代表域名
+    local custom=0
+    if jq -e --arg t "$main_tag" '.route.rule_set[]? | select(.tag == $t and .type == "inline")' "$route_file" >/dev/null 2>&1; then
+        custom=1
+        mapfile -t hosts < <(jq -r --arg t "$main_tag" '.route.rule_set[] | select(.tag == $t) | .rules[0].domain_suffix[]?' "$route_file")
+    else
+        hosts=("$(_pip_rep_host "$main_tag")")
+    fi
+    echo ""
+    yellow "正在检测能否经 ProxyIP 访问..."
+    for d in "${hosts[@]}"; do
+        [ -z "$d" ] && continue
+        if _pip_check_host "$d" "$pip_addr" "$fam" "$pip_port"; then
+            green "  ✔ ${d}  ${pip_chk_info}"; ok_hosts+=("$d")
+        else
+            yellow "  ✘ ${d}  (不可达，或该 ProxyIP 不支持转发此站点，已跳过)"
+        fi
+    done
+    if [ ${#ok_hosts[@]} -eq 0 ]; then
+        red "没有可用域名，已取消"
+        [ "$reuse" -eq 1 ] && yellow "提示：新规则沿用当前 ProxyIP；若它不支持转发该站点，请先在「ProxyIP 设置」里换成支持的 ProxyIP。"
+        _pip_cancel_pending "${tags[@]}"; sleep 3; return 0
+    fi
+
+    local tags_json domains_json
+    tags_json=$(printf '%s\n' "${tags[@]}" | jq -R . | jq -s .)
+    cp -f "$route_file" "${route_file}.bak"
+    if [ "$custom" -eq 1 ]; then
+        domains_json=$(printf '%s\n' "${ok_hosts[@]}" | jq -R . | jq -s .)
+        jq_write "$route_file" --arg t "$main_tag" --argjson dm "$domains_json" \
+            '.route.rule_set |= map(if .tag == $t then .rules = [{"domain_suffix": $dm}] else . end)'
+    fi
+    jq_write "$route_file" --argjson tags "$tags_json" --arg addr "$pip_addr" --argjson pport "$pip_port" '
+      .route.rules = (
+        [{"action":"sniff"}]
+        + [ .route.rules[]? | select(.action != "sniff") ]
+        + [
+            {"rule_set":$tags,"network":"udp","port":443,"action":"reject"},
+            {"rule_set":$tags,"network":"tcp","port":443,"action":"route","outbound":"direct","override_address":$addr,"override_port":$pport}
+          ]
+      )'
+    declare -F sort_gemini_first >/dev/null && sort_gemini_first
+
+    if ! _pip_route_commit; then
+        _pip_cancel_pending "${tags[@]}"; sleep 3; return 0
+    fi
+    if [ "$reuse" -eq 0 ]; then
+        if [ -z "$from_slot" ]; then
+            _pip_slot_set 1 "$pip_addr" "$pip_port"
+            [ -n "$pip_nat64_src" ] && _pip_nat64_save "$pip_addr" "$pip_nat64_src"
+        fi
+        _pip_conf_set CUR_ADDR "$pip_addr"; _pip_conf_set CUR_PORT "$pip_port"
+        _pip_conf_set FAILS 0; _pip_conf_set OKS 0
+    fi
+    green "\n'${main_tag}' 已分流至 ProxyIP $(_pip_hostport "$pip_addr" "$pip_port")，检测通过: ${ok_hosts[*]}"
+    yellow "提示：已同时拦截这些域名的 UDP/443(QUIC)，让浏览器回退到 TCP，否则 QUIC 会绕过 ProxyIP。"
+    [ "$(_pip_slot_count)" -lt 2 ] && yellow "提示：在「公共ProxyIP分流 → ProxyIP 设置」里最多可设置 5 个 ProxyIP，开启自动切换后，当前这个不通时会按顺序切到下一个。"
+    return 0
+}
+
 PIP_PAYLOAD_EOF
 }
 
@@ -1459,8 +1635,16 @@ remove_pip_rules() {
     fi
     cp -f "$rf" "${rf}.pipbak"
     if ! jq '
-        .route.rules = [ .route.rules[]? | select((.override_address == null) and (((.rule_set // []) | map(select(startswith("pip-"))) | length) == 0)) ]
-        | if .route.rule_set then .route.rule_set = [ .route.rule_set[] | select(((.tag // "") | startswith("pip-")) | not) ] else . end
+        ([.route.rules[]? | select(.override_address != null) | (.rule_set // [])[]] | unique) as $T
+        | .route.rules = [ .route.rules[]?
+            | select(
+                (.override_address == null)
+                and (((.rule_set // []) | map(select(startswith("pip-"))) | length) == 0)
+                and (((.action == "reject") and (.network == "udp") and (.port == 443)
+                      and (((.rule_set // []) | map(select(. as $x | ($T | index($x)) != null)) | length) > 0)) | not)
+              ) ]
+        | if .route.rule_set then .route.rule_set = [ .route.rule_set[]
+            | select((((.tag // "") | startswith("pip-")) or (.type == "inline" and ((.tag // "") as $g | ($T | index($g)) != null))) | not) ] else . end
       ' "${rf}.pipbak" > "${rf}.piptmp"; then
         rm -f "${rf}.piptmp" "${rf}.pipbak"; red "清理 ProxyIP 规则失败，已保持原配置不变"; return 1
     fi
