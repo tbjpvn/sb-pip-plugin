@@ -580,12 +580,12 @@ speedtest_proxyip_menu() {
             [ ${#names[@]} -eq 0 ] && { yellow "还没有配置 ProxyIP"; sleep 2; speedtest_proxyip_menu; return; }
             echo ""
             _pip_cfg_show 1
-            echo -e " ${green}8. 测试全部配置${re}"
+            echo -e " ${green}6. 测试全部配置 (直接回车默认)${re}"
             echo -e " ${purple}0. 返回${re}"
-            reading "请输入槽位序号 (回车返回): " sp_sub
+            reading "请输入槽位序号 (直接回车=测试全部，0=返回): " sp_sub
             case "$sp_sub" in
-                ""|0) speedtest_proxyip_menu; return ;;
-                8) tn=("${names[@]}"); ta=("${addrs[@]}"); tp=("${ports[@]}") ;;
+                0) speedtest_proxyip_menu; return ;;
+                ""|6) tn=("${names[@]}"); ta=("${addrs[@]}"); tp=("${ports[@]}") ;;
                 *)
                     if ! [[ "$sp_sub" =~ ^[1-5]$ ]]; then
                         red "无效的选择"; sleep 1; speedtest_proxyip_menu; return
@@ -615,7 +615,7 @@ speedtest_proxyip_menu() {
         *)
             red "无效的选择"; sleep 1; speedtest_proxyip_menu; return ;;
     esac
-    reading "是否同时测下载速度？(每个约15秒) (y/N): " sp_dl
+    reading "是否同时测下载速度？(每个约15秒) (Y/n，直接回车=测，输入 n 跳过): " sp_dl
     fam=$(_pip_fam)
     echo ""
     local dl_rec key hp nlit sum_lines=()
@@ -634,7 +634,7 @@ speedtest_proxyip_menu() {
         fi
         _pip_show_latency
         dl_rec=""
-        if [[ "$sp_dl" == "y" || "$sp_dl" == "Y" ]]; then
+        if [[ "$sp_dl" != "n" && "$sp_dl" != "N" ]]; then
             pip_dl_mbps=""
             _pip_download "${ta[$j]}" "${tp[$j]}" "$fam"
             if [ -n "$pip_dl_mbps" ]; then echo "  下载速度 约 ${pip_dl_mbps} Mbps"; dl_rec=$pip_dl_mbps; else yellow "  下载测速失败"; fi
