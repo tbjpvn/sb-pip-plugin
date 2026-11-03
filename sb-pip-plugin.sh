@@ -49,7 +49,7 @@ _pip_list_rules() {
       | .route.rules[]?
       | select(.override_address != null and (.rule_set | type) == "array")
       | .rule_set[0] as $t
-      | (first($root.route.rule_set[]? | select(.tag == $t) | .rules[0].domain_suffix // ["(全部TCP/443流量)"] | join(" ")) // "") as $d
+      | (first($root.route.rule_set[]? | select(.tag == $t) | .rules[0].domain_suffix | join(" ")) // "") as $d
       | "\($t)\t\(.override_address):\(.override_port // 443)\t\($d)"
     ' "$route_file" 2>/dev/null
 }
@@ -1041,10 +1041,9 @@ add_proxyip_route() {
     green "1. OpenAI/ChatGPT  (chatgpt.com openai.com oaistatic.com oaiusercontent.com)"
     green "2. Claude          (claude.ai claude.com anthropic.com)"
     green "3. 自定义域名 (仅限CF托管站点，添加时会自动逐个检测)"
-    green "4. 全局 (所有 TCP/443 流量都走 ProxyIP，仅测试用，非CF站点会打不开)"
     purple "0. 返回"
     reading "请输入选择: " pip_choice
-    local pip_name pip_domains=() pip_global=0
+    local pip_name pip_domains=()
     case "$pip_choice" in
         1) pip_name="openai";  pip_domains=(chatgpt.com openai.com oaistatic.com oaiusercontent.com) ;;
         2) pip_name="claude";  pip_domains=(claude.ai claude.com anthropic.com) ;;
@@ -1059,11 +1058,6 @@ add_proxyip_route() {
                 [[ "$d" =~ $_PIP_RE_DOM ]] && pip_domains+=("$d") || yellow "跳过无效域名: $d"
             done
             ;;
-        4)
-            yellow "全局模式：所有 TCP/443 流量都会转给 ProxyIP，非 Cloudflare 托管的站点将无法访问 (仅建议测试用)。"
-            reading "确认添加？(y/N): " g_go
-            _pip_yes "$g_go" || { proxyip_menu; return; }
-            pip_name="global"; pip_global=1; pip_domains=(all) ;;
         *) proxyip_menu; return ;;
     esac
     [ ${#pip_domains[@]} -eq 0 ] && { red "没有有效域名"; sleep 1; proxyip_menu; return; }
@@ -1077,33 +1071,27 @@ add_proxyip_route() {
         yellow "注意：同名的 '${pip_name}' 分流规则已在使用其他出站，先匹配的规则优先，建议先在 WARP分流管理 的「2. 删除分流服务」中删除它，否则 ProxyIP 可能不生效。"
     fi
 
-    local ok_domains=() d r rs_json
-    if [ "$pip_global" = 1 ]; then
-        ok_domains=("全部 TCP/443 流量")
-        rs_json='[{"port":[443]}]'
-    else
-        # 逐个域名检测：必须能经 ProxyIP 返回 CF trace，否则跳过
-        echo ""
-        yellow "正在检测各域名能否经 ProxyIP 访问..."
-        for d in "${pip_domains[@]}"; do
-            r=$(_pip_trace "$d" "$pip_addr" "$fam" "$pip_port")
-            if [ -n "$r" ]; then
-                green "  ✔ ${d}  ${r}"; ok_domains+=("$d")
-            else
-                yellow "  ✘ ${d}  (非CF托管或不可达，已跳过)"
-            fi
-        done
-        [ ${#ok_domains[@]} -eq 0 ] && { red "没有可用域名，已取消"; sleep 3; proxyip_menu; return; }
+    # 逐个域名检测：必须能经 ProxyIP 返回 CF trace，否则跳过
+    echo ""
+    yellow "正在检测各域名能否经 ProxyIP 访问..."
+    local ok_domains=() d r
+    for d in "${pip_domains[@]}"; do
+        r=$(_pip_trace "$d" "$pip_addr" "$fam" "$pip_port")
+        if [ -n "$r" ]; then
+            green "  ✔ ${d}  ${r}"; ok_domains+=("$d")
+        else
+            yellow "  ✘ ${d}  (非CF托管或不可达，已跳过)"
+        fi
+    done
+    [ ${#ok_domains[@]} -eq 0 ] && { red "没有可用域名，已取消"; sleep 3; proxyip_menu; return; }
 
-        local domains_json="[" dd
-        for dd in "${ok_domains[@]}"; do domains_json+="\"${dd}\","; done
-        domains_json="${domains_json%,}]"
-        rs_json="{\"domain_suffix\":${domains_json}}"; rs_json="[${rs_json}]"
-    fi
+    local domains_json="[" dd
+    for dd in "${ok_domains[@]}"; do domains_json+="\"${dd}\","; done
+    domains_json="${domains_json%,}]"
 
     cp -f "$route_file" "${route_file}.bak"
-    jq_write "$route_file" --arg tag "$tag" --argjson rs "$rs_json" --arg addr "$pip_addr" --argjson pport "$pip_port" '
-      .route.rule_set = ((.route.rule_set // []) + [{"tag":$tag,"type":"inline","rules":$rs}])
+    jq_write "$route_file" --arg tag "$tag" --argjson domains "$domains_json" --arg addr "$pip_addr" --argjson pport "$pip_port" '
+      .route.rule_set = ((.route.rule_set // []) + [{"tag":$tag,"type":"inline","rules":[{"domain_suffix":$domains}]}])
       | .route.rules = (
           [{"action":"sniff"}]
           + [ .route.rules[]? | select(.action != "sniff") ]
