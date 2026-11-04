@@ -569,6 +569,7 @@ speedtest_proxyip_menu() {
     green "测试选项:"
     echo -e " ${green}1. 测试当前配置${re}"
     echo -e " ${green}2. 测试其他地址 (域名/IP[:端口]，不写端口默认443，批量空格分隔)${re}"
+    echo -e " ${green}3. 稳定性测试 (持续下载，记录每秒速度/掉速/乱序，比普通测速更能反映直播会不会卡)${re}"
     echo -e " ${green}x. 清空测速记录${re}"
     echo -e " ${purple}0. 返回上级菜单${re}"
     reading "请输入选择: " sp_choice
@@ -610,6 +611,7 @@ speedtest_proxyip_menu() {
                 fi
             done
             [ ${#ta[@]} -eq 0 ] && { red "没有有效地址"; sleep 2; speedtest_proxyip_menu; return; } ;;
+        3) stability_proxyip_menu; return ;;
         x|X)
             rm -f "$(_pip_hf)"; green "已清空测速记录"; sleep 1; speedtest_proxyip_menu; return ;;
         *)
@@ -651,6 +653,192 @@ speedtest_proxyip_menu() {
     fi
     yellow "参考：聊天类(ChatGPT/Claude)主要看延迟，平均<600ms且无超时为良好；看视频才需要较高的下载速度。"
     reading "按回车返回测速页面" sp_any
+    speedtest_proxyip_menu
+}
+
+# ---- 稳定性测试：持续下载，每秒采样速度和内核记录的乱序包，看高峰期会不会掉速 ----
+# 数据流向是 ProxyIP -> 本机，本机只是接收方，看不到对方的重传(ss 里的 retrans 是本机发出的包，不反映下行丢包)。
+# 所以用两个指标：每秒实际速度掉到视频码率以下的次数；内核统计的乱序包 rcv_ooopack(丢包/乱序的迹象，内核 5.4+)。
+
+# 内核版本 >= $1.$2 ?
+_pip_st_kernel_ge() {
+    local v ma mi
+    v=$(uname -r | cut -d. -f1,2); ma=${v%%.*}; mi=${v##*.}; mi=${mi%%[!0-9]*}
+    [[ "$ma" =~ ^[0-9]+$ ]] || return 1
+    [ "$ma" -gt "$1" ] && return 0
+    [ "$ma" -eq "$1" ] && [ "${mi:-0}" -ge "$2" ]
+}
+
+# 启动一条后台下载连接，pid 放在 pip_st_cpid。依赖 pip_st_host/port/fam/rate/size/dur
+_pip_st_start() {
+    curl -s -o /dev/null $pip_st_fam --connect-timeout 5 -m $((pip_st_dur + 15)) "${pip_st_rate[@]}" \
+        --connect-to "speed.cloudflare.com:443:${pip_st_host}:${pip_st_port}" \
+        "https://speed.cloudflare.com/__down?bytes=${pip_st_size}" >/dev/null 2>&1 &
+    pip_st_cpid=$!
+}
+
+# 取指定 pid 那条连接在 ss 里的信息(多行合并成一行)
+_pip_st_ssline() {
+    ss -tinpH 2>/dev/null \
+        | awk '/^[^ \t]/{if(r!="")print r; r=$0; next}{r=r" "$0}END{if(r!="")print r}' \
+        | grep -F "pid=${1},"
+}
+
+# $1=地址 $2=端口 $3=IP族 $4=有效采样秒数 $5=限速Mbps $6=视频码率Mbps(每秒速度低于它算掉速)
+# 结果: pip_st_n pip_st_avg pip_st_min pip_st_max pip_st_low pip_st_run pip_st_cv pip_st_ooo(空=内核不提供) pip_st_err(有值=出过问题)
+# 返回 0=采到足够数据 1=失败
+_pip_stability() {
+    pip_st_host=$1; pip_st_port=${2:-443}; pip_st_fam=$3; pip_st_dur=${4:-30}
+    local cap=${5:-25} need=${6:-10}
+    local speeds=() iter=0 maxiter restarts=0 cw=0 nob=0 prev="" prev_o="" ooo=0 ooo_ok=0 line b o sp
+    [[ "$pip_st_host" == *:* ]] && pip_st_host="[${pip_st_host}]"
+    pip_st_rate=(--limit-rate "$((cap * 125000))")
+    pip_st_size=100000000
+    pip_st_n=0; pip_st_avg=0; pip_st_min=0; pip_st_max=0; pip_st_low=0; pip_st_run=0; pip_st_cv=0; pip_st_ooo=""; pip_st_err=""
+    _pip_st_kernel_ge 5 4 && ooo_ok=1
+    maxiter=$((pip_st_dur * 2 + 20))
+    _pip_st_start
+    while [ "${#speeds[@]}" -lt "$pip_st_dur" ] && [ "$iter" -lt "$maxiter" ]; do
+        sleep 1; iter=$((iter + 1))
+        if ! kill -0 "$pip_st_cpid" 2>/dev/null; then
+            # 100MB 下完或连接中断：重开一条继续测，新连接前几秒是慢启动，不计入
+            wait "$pip_st_cpid" 2>/dev/null
+            restarts=$((restarts + 1)); prev=""; prev_o=""; cw=0; nob=0
+            if [ "$restarts" -gt 6 ]; then pip_st_err="连接反复中断，无法持续下载"; break; fi
+            _pip_st_start; continue
+        fi
+        line=$(_pip_st_ssline "$pip_st_cpid")
+        [[ "$line" == ESTAB* ]] || continue
+        b=$(grep -oE 'bytes_received:[0-9]+' <<< "$line" | head -1 | cut -d: -f2)
+        if [ -z "$b" ]; then
+            # 刚建立还没收到数据时 ss 不显示该字段；持续没有说明 ss/内核不支持
+            nob=$((nob + 1))
+            if [ "$nob" -gt 8 ]; then pip_st_err="收不到数据，或内核/ss 不提供 bytes_received(需内核 4.19+)"; break; fi
+            continue
+        fi
+        o=$(grep -oE 'rcv_ooopack:[0-9]+' <<< "$line" | head -1 | cut -d: -f2)
+        o=${o:-0}
+        if [ -n "$prev" ]; then
+            cw=$((cw + 1))
+            if [ "$cw" -gt 3 ]; then       # 每条连接跳过前3秒(慢启动 + 接收缓冲填充)
+                sp=$(awk -v d=$((b - prev)) 'BEGIN{printf "%.2f", d*8/1000000}')
+                speeds+=("$sp")
+                [ "$ooo_ok" = 1 ] && [ -n "$prev_o" ] && ooo=$((ooo + o - prev_o))
+            fi
+        fi
+        prev=$b; prev_o=$o
+    done
+    kill "$pip_st_cpid" 2>/dev/null; wait "$pip_st_cpid" 2>/dev/null
+    if [ "${#speeds[@]}" -lt 5 ]; then
+        [ -z "$pip_st_err" ] && pip_st_err="没有采到足够的数据(连接失败、被限制或太慢)"
+        return 1
+    fi
+    read -r pip_st_n pip_st_avg pip_st_min pip_st_max pip_st_low pip_st_run pip_st_cv <<< "$(printf '%s\n' "${speeds[@]}" | awk -v need="$need" '
+        { v[NR]=$1; s+=$1; if (min=="" || $1<min) min=$1; if ($1>max) max=$1
+          if ($1<need) { low++; run++; if (run>mr) mr=run } else run=0 }
+        END { n=NR; avg=s/n; for (i=1;i<=n;i++) d+=(v[i]-avg)^2
+              printf "%d %.1f %.1f %.1f %d %d %.0f", n, avg, min, max, low+0, mr+0, (avg>0 ? sqrt(d/n)/avg*100 : 0) }')"
+    [ "$ooo_ok" = 1 ] && pip_st_ooo=$ooo
+    return 0
+}
+
+# 按 pip_st_* 评级 -> pip_st_lv (0稳定 1一般 2不稳定) pip_st_txt
+_pip_st_rate() {
+    if [ "$pip_st_low" -eq 0 ]; then
+        pip_st_lv=0; pip_st_txt="稳定"
+    elif [ $((pip_st_low * 10)) -le "$pip_st_n" ] && [ "$pip_st_run" -le 2 ]; then
+        pip_st_lv=1; pip_st_txt="一般 (偶尔掉速)"
+    else
+        pip_st_lv=2; pip_st_txt="不稳定 (频繁掉速，直播容易卡/出马赛克)"
+    fi
+}
+
+stability_proxyip_menu() {
+    clear
+    green "=== ProxyIP 稳定性测试 ===\n"
+    yellow "原理：按直播的节奏持续下载一段时间(限速，省流量)，每秒记录实际速度和内核统计的乱序包。"
+    yellow "平均速度再快，只要中途频繁掉到视频码率以下，直播就会卡或出现马赛克。建议在高峰期测。\n"
+    _pip_sync_conf
+    local names=() addrs=() ports=() nums=() a p j n
+    for n in 1 2 3 4 5; do
+        read -r a p <<< "$(_pip_slot_get "$n")"
+        [ -z "$a" ] && continue
+        names+=("ProxyIP ${n}"); addrs+=("$a"); ports+=("${p:-443}"); nums+=("$n")
+    done
+    _pip_cfg_show 0
+    echo ""
+    reading "输入槽位序号(1-5) 或 地址[:端口]，回车=测试全部槽位，0=返回: " st_in
+    local ta=() tp=() tn=() pip_addr pip_port si=-1 fam
+    case "$st_in" in
+        0) speedtest_proxyip_menu; return ;;
+        "")
+            [ ${#names[@]} -eq 0 ] && { yellow "还没有配置 ProxyIP，可直接输入地址测试"; sleep 2; stability_proxyip_menu; return; }
+            tn=("${names[@]}"); ta=("${addrs[@]}"); tp=("${ports[@]}") ;;
+        [1-5])
+            for j in "${!nums[@]}"; do [ "${nums[$j]}" = "$st_in" ] && si=$j; done
+            [ "$si" -lt 0 ] && { red "ProxyIP ${st_in} 还没有设置"; sleep 2; stability_proxyip_menu; return; }
+            tn=("${names[$si]}"); ta=("${addrs[$si]}"); tp=("${ports[$si]}") ;;
+        *)
+            if ! _pip_parse_addr "$(echo "$st_in" | xargs)"; then
+                red "地址或端口格式无效"; sleep 2; stability_proxyip_menu; return
+            fi
+            tn=("自定义"); ta=("$pip_addr"); tp=("${pip_port:-443}") ;;
+    esac
+    reading "直播的码率大约多少 Mbps？(1-50，回车默认10；每秒速度低于它就算掉速): " st_need
+    { [[ "$st_need" =~ ^[0-9]+$ ]] && [ "$st_need" -ge 1 ] && [ "$st_need" -le 50 ]; } || st_need=10
+    reading "每个测多少秒？(10-60，回车默认30): " st_dur
+    { [[ "$st_dur" =~ ^[0-9]+$ ]] && [ "$st_dur" -ge 10 ] && [ "$st_dur" -le 60 ]; } || st_dur=30
+    local st_cap=$((st_need * 3)); [ "$st_cap" -lt 25 ] && st_cap=25
+    local st_mb=$(( st_cap * 125000 * (st_dur + 4) / 1000000 ))
+    echo ""
+    yellow "限速 ${st_cap}Mbps，每个约消耗流量 ${st_mb}MB，共 ${#ta[@]} 个，预计 $(( ${#ta[@]} * (st_dur + 6) )) 秒"
+    command -v ss >/dev/null 2>&1 || { red "缺少 ss 命令(iproute2)，无法采样"; sleep 3; speedtest_proxyip_menu; return; }
+    fam=$(_pip_fam)
+    echo ""
+    local hp nlit ooo_txt msg key sum_lines=()
+    for j in "${!tn[@]}"; do
+        hp=$(_pip_hostport "${ta[$j]}" "${tp[$j]}")
+        echo -e "${green}${tn[$j]}${re}  ${yellow}${hp}${re}"
+        if [ -z "$(_pip_trace "" "${ta[$j]}" "$fam" "${tp[$j]}")" ]; then
+            nlit=""
+            if [ "$fam" = "-6" ] && [[ "${ta[$j]}" != *:* ]]; then
+                nlit=$(_pip_nat64_find "${ta[$j]}" "${tp[$j]}" "$fam")
+            fi
+            if [ -n "$nlit" ]; then
+                yellow "  纯 IPv6 环境，已改用公共 NAT64 合成地址: ${nlit}"
+                _pip_nat64_save "$nlit" "${ta[$j]}"
+                ta[$j]=$nlit; hp=$(_pip_hostport "${ta[$j]}" "${tp[$j]}")
+            else
+                red "  当前连不上，已跳过"; echo ""
+                sum_lines+=("99999999999"$'\t'"${green}${tn[$j]}${re} ${yellow}${hp}${re}  ${red}连不上${re}")
+                continue
+            fi
+        fi
+        echo "  测试中，约 ${st_dur} 秒..."
+        if _pip_stability "${ta[$j]}" "${tp[$j]}" "$fam" "$st_dur" "$st_cap" "$st_need"; then
+            _pip_st_rate
+            ooo_txt="${pip_st_ooo} 个"; [ -z "$pip_st_ooo" ] && ooo_txt="n/a (内核 5.4 以下不提供)"
+            echo "  平均 ${pip_st_avg}Mbps  最低 ${pip_st_min}  最高 ${pip_st_max}  波动 ${pip_st_cv}%"
+            echo "  低于 ${st_need}Mbps 的秒数: ${pip_st_low}/${pip_st_n} (最长连续 ${pip_st_run} 秒)    乱序包: ${ooo_txt}"
+            msg="  评级: ${pip_st_txt}"
+            case "$pip_st_lv" in 0) green "$msg" ;; 1) yellow "$msg" ;; *) red "$msg" ;; esac
+            [ -n "$pip_st_err" ] && yellow "  注意: ${pip_st_err}，结果仅供参考"
+            key=$(( pip_st_low * 1000000 + ${pip_st_ooo:-0} ))
+            sum_lines+=("${key}"$'\t'"${green}${tn[$j]}${re} ${yellow}${hp}${re}  ${pip_st_txt}  掉速${pip_st_low}/${pip_st_n}s  平均${pip_st_avg}Mbps  最低${pip_st_min}  乱序${pip_st_ooo:-n/a}")
+        else
+            red "  测试失败: ${pip_st_err}"
+            sum_lines+=("99999999998"$'\t'"${green}${tn[$j]}${re} ${yellow}${hp}${re}  ${red}测试失败${re}")
+        fi
+        echo ""
+    done
+    if [ ${#ta[@]} -ge 2 ]; then
+        green "汇总 (掉速秒数少的排前面，其次看乱序包):"
+        printf '%s\n' "${sum_lines[@]}" | sort -t$'\t' -k1,1n | cut -f2- | while IFS= read -r sl; do echo -e " ${sl}"; done
+        echo ""
+    fi
+    yellow "参考：评级「稳定」说明这次没有掉到视频码率以下；乱序包明显偏多说明路径上有丢包或乱序，直播容易花屏。"
+    yellow "同一个 ProxyIP 平时和高峰期表现可能差很多，建议在出现马赛克的时段重测，再把最稳的设为首选代理。"
+    reading "按回车返回测速页面" st_any
     speedtest_proxyip_menu
 }
 
