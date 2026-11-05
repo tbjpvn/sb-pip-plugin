@@ -671,9 +671,11 @@ _pip_st_kernel_ge() {
 
 # 启动一条后台下载连接，pid 放在 pip_st_cpid。依赖 pip_st_host/port/fam/rate/size/dur
 _pip_st_start() {
+    : > "$pip_st_diag"
+    pip_st_t0=$SECONDS
     curl -s -o /dev/null $pip_st_fam --connect-timeout 5 -m $((pip_st_dur + 15)) "${pip_st_rate[@]}" \
         --connect-to "speed.cloudflare.com:443:${pip_st_host}:${pip_st_port}" \
-        "https://speed.cloudflare.com/__down?bytes=${pip_st_size}" >/dev/null 2>&1 &
+        -w '%{http_code}' "https://speed.cloudflare.com/__down?bytes=${pip_st_size}" >"$pip_st_diag" 2>/dev/null &
     pip_st_cpid=$!
 }
 
@@ -690,10 +692,11 @@ _pip_st_ssline() {
 _pip_stability() {
     pip_st_host=$1; pip_st_port=${2:-443}; pip_st_fam=$3; pip_st_dur=${4:-30}
     local cap=${5:-25} need=${6:-10}
-    local speeds=() iter=0 maxiter restarts=0 cw=0 nob=0 prev="" prev_o="" ooo=0 ooo_ok=0 line b o sp
+    local speeds=() iter=0 maxiter qfail=0 skip=3 cw=0 nob=0 prev="" prev_o="" ooo=0 ooo_ok=0 line b o sp crc code pend="" pend_o=0
     [[ "$pip_st_host" == *:* ]] && pip_st_host="[${pip_st_host}]"
     pip_st_rate=(--limit-rate "$((cap * 125000))")
-    pip_st_size=100000000
+    pip_st_size=100000000; pip_st_note=""
+    pip_st_diag=$(mktemp 2>/dev/null) || pip_st_diag="/tmp/.pip_st_diag.$$"
     pip_st_n=0; pip_st_avg=0; pip_st_min=0; pip_st_max=0; pip_st_low=0; pip_st_run=0; pip_st_cv=0; pip_st_ooo=""; pip_st_err=""
     _pip_st_kernel_ge 5 4 && ooo_ok=1
     maxiter=$((pip_st_dur * 2 + 20))
@@ -701,10 +704,31 @@ _pip_stability() {
     while [ "${#speeds[@]}" -lt "$pip_st_dur" ] && [ "$iter" -lt "$maxiter" ]; do
         sleep 1; iter=$((iter + 1))
         if ! kill -0 "$pip_st_cpid" 2>/dev/null; then
-            # 100MB 下完或连接中断：重开一条继续测，新连接前几秒是慢启动，不计入
-            wait "$pip_st_cpid" 2>/dev/null
-            restarts=$((restarts + 1)); prev=""; prev_o=""; cw=0; nob=0
-            if [ "$restarts" -gt 6 ]; then pip_st_err="连接反复中断，无法持续下载"; break; fi
+            # 一条下完(25MB)或中断：重开一条继续测，新连接前几秒是慢启动，不计入
+            wait "$pip_st_cpid" 2>/dev/null; crc=$?
+            code=$(cat "$pip_st_diag" 2>/dev/null)
+            prev=""; prev_o=""; cw=0; nob=0; skip=2; pend=""; pend_o=0
+            if [ "$code" != 200 ] || { [ "$crc" -ne 0 ] && [ $((SECONDS - pip_st_t0)) -lt 4 ]; }; then
+                # 没拿到正常响应，或刚连上就被断开：不是正常下完
+                if [ "$pip_st_size" -gt 25000000 ]; then
+                    # 可能是对方限制了单次下载量：降到25MB再试一次，限速和码率阈值一并调低，保证单条能撑够十来秒
+                    pip_st_size=25000000; cap=20; [ "$need" -gt 15 ] && need=15
+                    pip_st_rate=(--limit-rate "$((cap * 125000))")
+                    pip_st_note="对方不接受大文件下载，已改为 25MB/次、限速 ${cap}Mbps，掉速阈值按 ${need}Mbps 判断"
+                    _pip_st_start; continue
+                fi
+                qfail=$((qfail + 1))
+                if [ "$qfail" -gt 3 ]; then
+                    pip_st_err="下载连接一建立就被断开 (curl退出码 ${crc}, HTTP ${code:-无})"
+                    case "$code" in
+                        403|429) pip_st_err+="，对方可能禁止/限制了测速域名 speed.cloudflare.com，换一个 ProxyIP 试试" ;;
+                        000|"")  pip_st_err+="，没有收到响应，可能被对方直接断开" ;;
+                    esac
+                    break
+                fi
+            else
+                qfail=0
+            fi
             _pip_st_start; continue
         fi
         line=$(_pip_st_ssline "$pip_st_cpid")
@@ -720,15 +744,18 @@ _pip_stability() {
         o=${o:-0}
         if [ -n "$prev" ]; then
             cw=$((cw + 1))
-            if [ "$cw" -gt 3 ]; then       # 每条连接跳过前3秒(慢启动 + 接收缓冲填充)
+            if [ "$cw" -gt "$skip" ]; then       # 每条连接跳过开头几秒(慢启动 + 接收缓冲填充)
                 sp=$(awk -v d=$((b - prev)) 'BEGIN{printf "%.2f", d*8/1000000}')
-                speeds+=("$sp")
-                [ "$ooo_ok" = 1 ] && [ -n "$prev_o" ] && ooo=$((ooo + o - prev_o))
+                # 样本先放一格，下一秒连接还活着才入账；一条连接最后那一秒只传了一部分，不算
+                if [ -n "$pend" ]; then speeds+=("$pend"); ooo=$((ooo + pend_o)); fi
+                pend=$sp; pend_o=0
+                [ "$ooo_ok" = 1 ] && [ -n "$prev_o" ] && pend_o=$((o - prev_o))
             fi
         fi
         prev=$b; prev_o=$o
     done
     kill "$pip_st_cpid" 2>/dev/null; wait "$pip_st_cpid" 2>/dev/null
+    rm -f "$pip_st_diag"
     if [ "${#speeds[@]}" -lt 5 ]; then
         [ -z "$pip_st_err" ] && pip_st_err="没有采到足够的数据(连接失败、被限制或太慢)"
         return 1
@@ -739,6 +766,7 @@ _pip_stability() {
         END { n=NR; avg=s/n; for (i=1;i<=n;i++) d+=(v[i]-avg)^2
               printf "%d %.1f %.1f %.1f %d %d %.0f", n, avg, min, max, low+0, mr+0, (avg>0 ? sqrt(d/n)/avg*100 : 0) }')"
     [ "$ooo_ok" = 1 ] && pip_st_ooo=$ooo
+    pip_st_need=$need
     return 0
 }
 
@@ -789,9 +817,9 @@ stability_proxyip_menu() {
     reading "每个测多少秒？(10-60，回车默认30): " st_dur
     { [[ "$st_dur" =~ ^[0-9]+$ ]] && [ "$st_dur" -ge 10 ] && [ "$st_dur" -le 60 ]; } || st_dur=30
     local st_cap=$((st_need * 3)); [ "$st_cap" -lt 25 ] && st_cap=25
-    local st_mb=$(( st_cap * 125000 * (st_dur + 4) / 1000000 ))
+    local st_mb=$(( st_cap * 125000 * (st_dur * 2) / 1000000 ))
     echo ""
-    yellow "限速 ${st_cap}Mbps，每个约消耗流量 ${st_mb}MB，共 ${#ta[@]} 个，预计 $(( ${#ta[@]} * (st_dur + 6) )) 秒"
+    yellow "限速 ${st_cap}Mbps，每个最多消耗流量约 ${st_mb}MB，共 ${#ta[@]} 个，最多约 $(( ${#ta[@]} * (st_dur * 2 + 6) )) 秒"
     command -v ss >/dev/null 2>&1 || { red "缺少 ss 命令(iproute2)，无法采样"; sleep 3; speedtest_proxyip_menu; return; }
     fam=$(_pip_fam)
     echo ""
@@ -819,9 +847,10 @@ stability_proxyip_menu() {
             _pip_st_rate
             ooo_txt="${pip_st_ooo} 个"; [ -z "$pip_st_ooo" ] && ooo_txt="n/a (内核 5.4 以下不提供)"
             echo "  平均 ${pip_st_avg}Mbps  最低 ${pip_st_min}  最高 ${pip_st_max}  波动 ${pip_st_cv}%"
-            echo "  低于 ${st_need}Mbps 的秒数: ${pip_st_low}/${pip_st_n} (最长连续 ${pip_st_run} 秒)    乱序包: ${ooo_txt}"
+            echo "  低于 ${pip_st_need}Mbps 的秒数: ${pip_st_low}/${pip_st_n} (最长连续 ${pip_st_run} 秒)    乱序包: ${ooo_txt}"
             msg="  评级: ${pip_st_txt}"
             case "$pip_st_lv" in 0) green "$msg" ;; 1) yellow "$msg" ;; *) red "$msg" ;; esac
+            [ -n "$pip_st_note" ] && yellow "  注意: ${pip_st_note}"
             [ -n "$pip_st_err" ] && yellow "  注意: ${pip_st_err}，结果仅供参考"
             key=$(( pip_st_low * 1000000 + ${pip_st_ooo:-0} ))
             sum_lines+=("${key}"$'\t'"${green}${tn[$j]}${re} ${yellow}${hp}${re}  ${pip_st_txt}  掉速${pip_st_low}/${pip_st_n}s  平均${pip_st_avg}Mbps  最低${pip_st_min}  乱序${pip_st_ooo:-n/a}")
