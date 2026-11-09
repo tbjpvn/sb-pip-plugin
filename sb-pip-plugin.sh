@@ -871,6 +871,116 @@ stability_proxyip_menu() {
     speedtest_proxyip_menu
 }
 
+# ---- 站点可用性检测：检测 ProxyIP 能不能正常访问你指定的站点，并让自动切换服务也用它判断 ----
+# 延迟和下载测速只能说明"通不通"。有的站点会拒绝某些出口 IP(比如公共 ProxyIP 人太多被限流)，
+# 这时能连上、速度也快，但页面或播放请求会被拒绝。这里直接请求指定地址，按状态码和响应内容判断。
+# 检测地址和关键字用 base64 存进配置(URL 里常有 & ，正则里常有 | ，直接存会被 sed 弄坏)。
+_pip_b64e() { printf '%s' "$1" | base64 | tr -d '\n'; }
+_pip_b64d() { printf '%s' "$1" | base64 -d 2>/dev/null; }
+_pip_site_get() { _pip_b64d "$(_pip_conf_get "$1")"; }      # SITE_URL / SITE_EXPECT / SITE_DENY
+_pip_site_set() { if [ -n "$2" ]; then _pip_conf_set "$1" "$(_pip_b64e "$2")"; else _pip_conf_del "$1"; fi; }
+_pip_site_state() { [ -n "$(_pip_conf_get SITE_URL)" ] && echo "已设置" || echo "未设置"; }
+_pip_re_ok() { printf '' | grep -E -- "$1" >/dev/null 2>&1; [ $? -le 1 ]; }   # 正则合法(不管有没有匹配)
+
+# $1=地址 $2=端口 $3=IP族
+# 结果: pip_site_code pip_site_ms pip_site_ok(1/0) pip_site_why pip_site_snip(响应开头，帮你挑关键字)
+# 通过条件: 状态码 2xx/3xx；设了成功关键字则响应里必须有；设了失败关键字则响应里不能有
+_pip_site_check() {
+    local addr=$1 port=${2:-443} fam=$3 url host ex dn tmp t
+    pip_site_code=000; pip_site_ms=0; pip_site_ok=0; pip_site_why=""; pip_site_snip=""
+    url=$(_pip_site_get SITE_URL); ex=$(_pip_site_get SITE_EXPECT); dn=$(_pip_site_get SITE_DENY)
+    [ -z "$url" ] && { pip_site_why="未设置检测地址"; return 1; }
+    host=${url#https://}; host=${host%%[/?#]*}
+    [[ "$addr" == *:* ]] && addr="[${addr}]"
+    tmp=$(mktemp 2>/dev/null) || tmp="/tmp/.pip_site.$$"
+    t=$(curl -s $fam -o "$tmp" --max-filesize 2000000 --connect-timeout 5 -m 10 -A 'Mozilla/5.0' \
+        --connect-to "${host}:443:${addr}:${port}" -w '%{http_code} %{time_starttransfer}' "$url" 2>/dev/null)
+    pip_site_code=${t%% *}; pip_site_code=${pip_site_code:-000}
+    pip_site_ms=$(awk -v t="${t#* }" 'BEGIN{printf "%d", t*1000}')
+    pip_site_snip=$(head -c 200 "$tmp" 2>/dev/null | LC_ALL=C tr -d '\000-\037' | head -c 120)
+    if ! [[ "$pip_site_code" =~ ^[23][0-9][0-9]$ ]]; then
+        pip_site_why="HTTP ${pip_site_code}"; [ "$pip_site_code" = 000 ] && pip_site_why="连接失败或超时"
+        rm -f "$tmp"; return 1
+    fi
+    if [ -n "$ex" ] && ! grep -aE -- "$ex" "$tmp" >/dev/null 2>&1; then
+        pip_site_why="响应里没有成功关键字"; rm -f "$tmp"; return 1
+    fi
+    if [ -n "$dn" ] && grep -aE -- "$dn" "$tmp" >/dev/null 2>&1; then
+        pip_site_why="响应里出现了失败关键字"; rm -f "$tmp"; return 1
+    fi
+    pip_site_ok=1; rm -f "$tmp"; return 0
+}
+
+site_check_menu() {
+    clear
+    green "=== 站点可用性检测 ===\n"
+    yellow "作用：直接请求你指定的地址，检查每个 ProxyIP 是不是被该站点接受(延迟和下载测速只能看通不通、快不快，发现不了被站点拒绝)。"
+    yellow "设置后，自动切换服务也会用它判断：当前 ProxyIP 被该站点拒绝时，会自动换到能用的槽位。\n"
+    local u ex dn
+    u=$(_pip_site_get SITE_URL); ex=$(_pip_site_get SITE_EXPECT); dn=$(_pip_site_get SITE_DENY)
+    echo -e " ${green}检测地址:${re} ${yellow}${u:-未设置}${re}"
+    echo -e " ${green}成功关键字:${re} ${yellow}${ex:-未设置 (只看状态码 2xx/3xx)}${re}"
+    echo -e " ${green}失败关键字:${re} ${yellow}${dn:-未设置}${re}"
+    echo -e " ${green}自动切换:${re} ${yellow}$(_pip_watch_state)${re}"
+    echo ""
+    green  "1. 设置检测地址"
+    green  "2. 设置成功关键字 (响应里必须出现，可留空)"
+    green  "3. 设置失败关键字 (响应里出现就算失败，可留空)"
+    green  "4. 立即检测全部槽位"
+    red    "5. 清除设置 (关闭站点检测)"
+    purple "0. 返回"
+    reading "请输入选择: " sc_choice
+    local v i a p fam n names=() addrs=() ports=() msg
+    case "$sc_choice" in
+        0) proxyip_menu; return ;;
+        1)
+            echo ""
+            yellow "怎么选地址：在浏览器里复现问题(比如播放失败)，按 F12 打开 Network，点那个报错的请求 -> 复制它的 URL。"
+            yellow "要求：以 https:// 开头，不带端口；站点要在 Cloudflare 上(否则 ProxyIP 本来就用不了)。"
+            yellow "地址里如果带登录信息或临时 token，会过期或泄露，请换成不带它们的地址。\n"
+            reading "请输入检测地址 (回车返回): " v
+            [ -z "$v" ] && { site_check_menu; return; }
+            if ! [[ "$v" =~ ^https://[A-Za-z0-9.-]+(/[^[:space:]]*)?$ ]]; then
+                red "地址格式不对：要以 https:// 开头，域名后不能带端口，且不能有空格"; sleep 3; site_check_menu; return
+            fi
+            _pip_site_set SITE_URL "$v"; green "已设置检测地址"; sleep 1; site_check_menu; return ;;
+        2|3)
+            [ -z "$u" ] && { red "请先设置检测地址"; sleep 2; site_check_menu; return; }
+            echo ""
+            yellow "支持正则(egrep)。可先用「4. 立即检测」看各槽位返回的内容，再选一个能区分的词。"
+            yellow "例如成功响应里一定有 \"url\"，失败响应里有 \"error|denied\"。回车留空则清除。\n"
+            reading "请输入关键字: " v
+            if [ -n "$v" ] && ! _pip_re_ok "$v"; then red "不是有效的正则表达式"; sleep 2; site_check_menu; return; fi
+            if [ "$sc_choice" = 2 ]; then _pip_site_set SITE_EXPECT "$v"; else _pip_site_set SITE_DENY "$v"; fi
+            green "已保存"; sleep 1; site_check_menu; return ;;
+        4)
+            [ -z "$u" ] && { red "请先设置检测地址"; sleep 2; site_check_menu; return; }
+            _pip_sync_conf
+            for n in 1 2 3 4 5; do
+                read -r a p <<< "$(_pip_slot_get "$n")"
+                [ -z "$a" ] && continue
+                names+=("ProxyIP ${n}"); addrs+=("$a"); ports+=("${p:-443}")
+            done
+            [ ${#names[@]} -eq 0 ] && { yellow "还没有配置 ProxyIP 槽位"; sleep 2; site_check_menu; return; }
+            fam=$(_pip_fam)
+            echo ""
+            for i in "${!names[@]}"; do
+                _pip_site_check "${addrs[$i]}" "${ports[$i]}" "$fam"
+                msg="${names[$i]}  $(_pip_hostport "${addrs[$i]}" "${ports[$i]}")  HTTP ${pip_site_code}  ${pip_site_ms}ms"
+                if [ "$pip_site_ok" = 1 ]; then green " ✔ ${msg}  通过"; else red " ✘ ${msg}  ${pip_site_why}"; fi
+                echo "     响应开头: ${pip_site_snip:-(空)}"
+            done
+            echo ""
+            yellow "提示：同一站点对不同槽位的响应如果不一样，就用不一样的那部分设成功/失败关键字，检测会更准。"
+            reading "按回车返回" sc_any
+            site_check_menu; return ;;
+        5)
+            _pip_site_set SITE_URL ""; _pip_site_set SITE_EXPECT ""; _pip_site_set SITE_DENY ""
+            green "已清除，站点检测已关闭"; sleep 1; site_check_menu; return ;;
+        *) red "无效的选择"; sleep 1; site_check_menu; return ;;
+    esac
+}
+
 # 日志/测速记录时区：VPS 本机时区 <-> 当前 ProxyIP 所在时区
 proxyip_tz_toggle() {
     if [ "$(_pip_conf_get LOG_TZ)" = proxyip ]; then
@@ -925,6 +1035,7 @@ proxyip_menu() {
     green  "3. ProxyIP 设置"
     green  "4. ProxyIP 测速"
     green  "5. 时区切换 (当前: $(_pip_logtz_label)  *只供测速与日志使用*)"
+    green  "6. 站点可用性检测 (检测 ProxyIP 是否被指定站点接受，并用于自动切换，当前: $(_pip_site_state))"
     purple "0. 返回上级菜单"
     reading "请输入选择: " pip_menu_choice
     case "$pip_menu_choice" in
@@ -933,6 +1044,7 @@ proxyip_menu() {
         3) proxyip_slot_menu ;;
         4) speedtest_proxyip_menu ;;
         5) proxyip_tz_toggle; proxyip_menu ;;
+        6) site_check_menu ;;
         0) warp_manage ;;
         *) red "无效选项"; sleep 1; proxyip_menu ;;
     esac
@@ -1461,10 +1573,44 @@ probe() {
     done
     probe_ms=0; return 1
 }
-# 健康 = 可通 且 首字节延迟不超过 SLOW_MS
+# 站点检测(可选)：配置了 SITE_URL 才生效。请求该地址，状态码 2xx/3xx，且满足成功/失败关键字才算通过。
+# 用来发现"能连上、速度也快，但被目标站点拒绝"的 ProxyIP(比如公共出口人太多被限流)。
+site_why=""
+site_ok() {   # $1=地址 $2=端口
+    local url host ex dn addr=$1 port=$2 tmp t code try
+    site_why=""
+    url=$(get SITE_URL | base64 -d 2>/dev/null); [ -z "$url" ] && return 0
+    ex=$(get SITE_EXPECT | base64 -d 2>/dev/null); dn=$(get SITE_DENY | base64 -d 2>/dev/null)
+    host=${url#https://}; host=${host%%[/?#]*}
+    [[ "$addr" == *:* ]] && addr="[${addr}]"
+    tmp=$(mktemp 2>/dev/null) || tmp="/tmp/.pip_site.$$"
+    code=000
+    for try in 1 2; do
+        t=$(curl -s $fam -o "$tmp" --max-filesize 2000000 --connect-timeout 5 -m 10 -A 'Mozilla/5.0' \
+            --connect-to "${host}:443:${addr}:${port}" -w '%{http_code}' "$url" 2>/dev/null)
+        code=${t:-000}
+        [ "$code" != 000 ] && break          # 连接失败/超时才重试一次，被拒绝(有状态码)不重试
+        [ "$try" -eq 1 ] && sleep 2
+    done
+    if ! [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then
+        site_why="HTTP ${code}"; [ "$code" = 000 ] && site_why="连接失败或超时"
+        rm -f "$tmp"; return 1
+    fi
+    if [ -n "$ex" ] && ! grep -aE -- "$ex" "$tmp" >/dev/null 2>&1; then site_why="没有成功关键字"; rm -f "$tmp"; return 1; fi
+    if [ -n "$dn" ] && grep -aE -- "$dn" "$tmp" >/dev/null 2>&1; then site_why="出现失败关键字"; rm -f "$tmp"; return 1; fi
+    rm -f "$tmp"; return 0
+}
+# 健康 = 可通 且 首字节延迟不超过 SLOW_MS 且 (配置了的话) 站点检测通过
 SLOW_MS=3000
-good() { probe "$1" "$2" && [ "$probe_ms" -le "$SLOW_MS" ]; }
-ms_txt() { if [ "$probe_ms" -gt 0 ]; then echo "过慢 ${probe_ms}ms"; else echo "不通"; fi; }
+bad_why=""
+good() {
+    bad_why=""
+    probe "$1" "$2" || { bad_why="不通"; return 1; }
+    [ "$probe_ms" -le "$SLOW_MS" ] || { bad_why="过慢 ${probe_ms}ms"; return 1; }
+    site_ok "$1" "$2" || { bad_why="站点检测未通过(${site_why})"; return 1; }
+    return 0
+}
+ms_txt() { echo "${bad_why:-不通}"; }
 has_rules() {
     jq -e '[.route.rules[]? | select(.override_address != null)] | length > 0' "$route_file" >/dev/null 2>&1
 }
@@ -1573,7 +1719,7 @@ tick() {
             switch_to "${sa[$i]}" "${sp[$i]}" "当前不通或过慢，已切换到 ProxyIP ${sn[$i]}" && return 0
         fi
     done
-    log "所有槽位的 ProxyIP 都不通或过慢，保持不变"
+    log "所有槽位的 ProxyIP 都不通、过慢或站点检测未通过，保持不变"
 }
 
 case "$1" in
